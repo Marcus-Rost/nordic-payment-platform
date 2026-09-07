@@ -4,6 +4,8 @@ A security-focused reference implementation for Nordic and European payments, co
 
 > Independent portfolio project—not a bank, payment institution, or production payment service.
 
+This project was created for portfolio work and professional development. It has never served real customers or processed real money; all identities, accounts, credentials, balances, and transactions are synthetic.
+
 ## Source code and tests
 
 - [Backend implementation](implementation/) — 478 Java and 34 Kotlin files
@@ -12,6 +14,8 @@ A security-focused reference implementation for Nordic and European payments, co
 - [Web clients](implementation/admin-web/src/) and [mobile clients](implementation/android-app/app/src/)
 - [Cross-service smoke tests](implementation/jrpay-smoke-tests/src/test/java/)
 - Unit and integration tests are colocated under each module's `src/test/` directory
+
+For a focused application review, follow the [Nuto review guide](NUTO_REVIEW_GUIDE.md).
 
 ## The problem
 
@@ -56,6 +60,10 @@ cd docker && docker compose up -d
 
 The fastest infrastructure-backed demonstration starts the account-ledger and Verification-of-Payee services and then runs `implementation/scripts/run-demo.sh`. See [BUILD_GUIDE.md](BUILD_GUIDE.md) for exact commands.
 
+## Recorded demonstration
+
+For a quick review without running the stack, start with the [payment demo guide](demo/README.md) and [captured output](demo/DEMO_OUTPUT.txt). It shows synthetic account creation, beneficiary-name verification, privacy behavior, a NOK transfer, updated balances, and the conservation-of-money invariant.
+
 ## Engineering highlights
 
 - Event sourcing and rebuildable projections for ledger truth
@@ -73,6 +81,7 @@ The fastest infrastructure-backed demonstration starts the account-ledger and Ve
 - `subsystems/` — requirements and designs by bounded context
 - `use_cases/` — cross-service payment journeys
 - `requirements/` — system requirements and regulatory mapping
+- `reviews/` and `docs/` — security, implementation, end-to-end, and AI-assisted-development evidence
 - [Roadmap](ROADMAP.md) · [Implementation boundary](docs/IMPLEMENTATION_STATUS.md) · [Navigation](NAVIGATION.md)
 
 ## Safety
