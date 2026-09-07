@@ -4,6 +4,15 @@ A security-focused reference implementation for Nordic and European payments, co
 
 > Independent portfolio project—not a bank, payment institution, or production payment service.
 
+## Source code and tests
+
+- [Backend implementation](implementation/) — 478 Java and 34 Kotlin files
+- [Account-ledger source](implementation/jrpay-account-ledger/src/main/java/)
+- [Fraud-detection source](implementation/jrpay-fraud-detection/src/main/java/)
+- [Web clients](implementation/admin-web/src/) and [mobile clients](implementation/android-app/app/src/)
+- [Cross-service smoke tests](implementation/jrpay-smoke-tests/src/test/java/)
+- Unit and integration tests are colocated under each module's `src/test/` directory
+
 ## The problem
 
 Moving money safely is a distributed-systems problem: every retry, crash, timeout, duplicate, late response, and reconciliation mismatch must have a defined outcome. The project translates those concerns—and PSD2, instant-payment, privacy, and operational-resilience requirements—into service boundaries and tests.
@@ -69,4 +78,3 @@ The fastest infrastructure-backed demonstration starts the account-ledger and Ve
 ## Safety
 
 All accounts, identities, balances, and transactions used in examples are synthetic. Real credentials, personal data, and production financial integrations do not belong in this repository.
-
