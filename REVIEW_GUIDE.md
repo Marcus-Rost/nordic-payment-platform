@@ -1,4 +1,4 @@
-# Review guide for Nuto
+# Review guide
 
 This project provides evidence of production-oriented engineering, security ownership, and critical review of AI-assisted implementation in a high-integrity domain.
 
@@ -19,4 +19,3 @@ This project provides evidence of production-oriented engineering, security owne
 - Failure recovery, idempotency, reconciliation, and auditability as first-class concerns
 
 This is a portfolio reference implementation. It has never served real customers or processed real payments; all data and credentials are synthetic.
-

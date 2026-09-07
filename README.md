@@ -15,7 +15,7 @@ This project was created for portfolio work and professional development. It has
 - [Cross-service smoke tests](implementation/jrpay-smoke-tests/src/test/java/)
 - Unit and integration tests are colocated under each module's `src/test/` directory
 
-For a focused application review, follow the [Nuto review guide](REVIEW_GUIDE.md).
+For a focused technical review, follow the [review guide](REVIEW_GUIDE.md).
 
 ## The problem
 
