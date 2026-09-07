@@ -1,0 +1,665 @@
+openapi: 3.1.0
+info:
+  title: JRPay — Admin Fraud
+  version: 1.0.0
+  description: |
+    Admin-facing fraud-case queue and decision surface. Realises UC-G31
+    (queue + triage), UC-G32 (decide CONFIRMED_FRAUD with account freeze),
+    UC-G33 (decide DISMISSED with payment release). Bulk-decide and live
+    SSE feed for queue updates are included.
+
+    Hosted by the A5 case projection (new `FraudCaseProjector`, Phase 2L).
+    Every decision requires step-up SCA with dynamic-linking class
+    `admin-action`, `action ∈ {DECIDE_FRAUD}`,
+    `resourceType=case`, `resourceId=<caseId>`, `decision ∈
+    {CONFIRMED_FRAUD, DISMISSED}` (`DYNAMIC_LINKING.md`).
+
+    See `shared-schemas.yaml` for enums + Problem envelope + pagination.
+
+servers:
+  - url: "https://admin-api.{env}.jrpay.example"
+    variables: { env: { default: dev } }
+  - url: "http://localhost:8095"
+    description: Local dev (A5 port)
+
+tags:
+  - name: Fraud-Queue
+    description: UC-G31 — list / search / assign / SSE
+  - name: Fraud-Case
+    description: UC-G31 — detail + account context
+  - name: Fraud-Decide
+    description: UC-G32, UC-G33 — per-case and bulk decisions
+  - name: Fraud-Stream
+    description: SSE for live queue/case updates per SSE_CONVENTIONS.md
+
+paths:
+  #############################################################################
+  # Queue (UC-G31 §6.3)
+  #############################################################################
+  /api/v1/admin/fraud/cases:
+    get:
+      tags: [Fraud-Queue]
+      summary: List fraud cases (UC-G31 §6.3)
+      description: |
+        Paginated queue. Default filter: `status=OPEN,ASSIGNED`. Filters
+        compose with AND server-side. Sort defaults to `score,desc`; other
+        accepted sort keys: `createdAt,asc`, `slaDeadline,asc`.
+      operationId: listFraudCases
+      security:
+        - OAuth2Admin: [fraud:read]
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: array
+            items: { $ref: "shared-schemas.yaml#/components/schemas/FraudDecision" }
+          style: form
+          explode: true
+        - name: minScore
+          in: query
+          schema: { type: number, minimum: 0, maximum: 1 }
+        - name: maxScore
+          in: query
+          schema: { type: number, minimum: 0, maximum: 1 }
+        - name: rule
+          in: query
+          description: Triggered-rule id (e.g. `VEL-04`).
+          schema: { type: string }
+        - name: accountId
+          in: query
+          schema: { type: string }
+        - name: assignee
+          in: query
+          description: Operator id or the literal `unassigned` / `me`.
+          schema: { type: string }
+        - name: from
+          in: query
+          schema: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        - name: to
+          in: query
+          schema: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        - $ref: "shared-schemas.yaml#/components/parameters/PageNumber"
+        - $ref: "shared-schemas.yaml#/components/parameters/PageSize"
+        - $ref: "shared-schemas.yaml#/components/parameters/SortAsc"
+        - $ref: "shared-schemas.yaml#/components/parameters/AcceptLanguage"
+      responses:
+        "200":
+          description: Paginated case summaries.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, page, counters]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/FraudCaseSummary" }
+                  page: { $ref: "shared-schemas.yaml#/components/schemas/PageMeta" }
+                  counters:
+                    type: object
+                    description: Queue-wide counters for dashboard widgets.
+                    required: [openTotal, assignedToMe, slaBreached]
+                    properties:
+                      openTotal: { type: integer, minimum: 0 }
+                      assignedToMe: { type: integer, minimum: 0 }
+                      slaBreached: { type: integer, minimum: 0 }
+        "401": { $ref: "shared-schemas.yaml#/components/responses/Problem401" }
+        "403": { $ref: "shared-schemas.yaml#/components/responses/Problem403" }
+
+  /api/v1/admin/fraud/cases/{caseId}:
+    get:
+      tags: [Fraud-Case]
+      summary: Fraud-case detail (UC-G31 §6.6)
+      description: |
+        Rich detail: transaction panel, score breakdown, timeline of state
+        transitions, decision panel metadata. PII is masked by default;
+        a reveal requires UC-G36 (`admin-accounts.yaml`) and is audited.
+
+        Viewing the case emits `audit.fraud.case.viewed` server-side.
+      operationId: getFraudCase
+      security:
+        - OAuth2Admin: [fraud:read]
+      parameters:
+        - $ref: "#/components/parameters/CaseId"
+      responses:
+        "200":
+          description: Case detail.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/FraudCaseDetail" }
+        "404": { $ref: "shared-schemas.yaml#/components/responses/Problem404" }
+
+  /api/v1/admin/fraud/cases/{caseId}/context:
+    get:
+      tags: [Fraud-Case]
+      summary: Composite account-context panel (UC-G31 §6.6)
+      description: |
+        30-day snapshot for the debtor account: total volume, unique
+        counterparties, new-beneficiary count, average transaction size,
+        deviation indicators. Server aggregates from A1 + audit projection;
+        response is cacheable for 60 s.
+      operationId: getFraudCaseContext
+      security:
+        - OAuth2Admin: [fraud:read]
+      parameters:
+        - $ref: "#/components/parameters/CaseId"
+      responses:
+        "200":
+          description: Context snapshot.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/FraudCaseContext" }
+
+  /api/v1/admin/fraud/cases/{caseId}/assign:
+    post:
+      tags: [Fraud-Queue]
+      summary: Assign case to an operator (UC-G31 §6 step 4)
+      description: |
+        Assigns or reassigns. Self-assign with `assignee=me`; reassign to a
+        named operator (SUPERVISOR-only). No SCA — low-risk action per
+        UC-G31 §6 step 4 + ARCHITECTURE_DECISIONS G.10b optimistic pattern.
+      operationId: assignFraudCase
+      security:
+        - OAuth2Admin: [fraud:manage]
+      parameters:
+        - $ref: "#/components/parameters/CaseId"
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/FraudAssignRequest" }
+      responses:
+        "200":
+          description: Assigned.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/FraudCaseDetail" }
+        "403": { $ref: "shared-schemas.yaml#/components/responses/Problem403" }
+        "404": { $ref: "shared-schemas.yaml#/components/responses/Problem404" }
+        "409":
+          description: urn:problem:case-already-decided
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+
+  #############################################################################
+  # Decide (UC-G32, UC-G33)
+  #############################################################################
+  /api/v1/admin/fraud/cases/{caseId}/decide:
+    post:
+      tags: [Fraud-Decide]
+      summary: Decide a case — CONFIRMED_FRAUD or DISMISSED (UC-G32 / UC-G33)
+      description: |
+        Submits the operator's decision. Step-up SCA required — the
+        `Step-Up-Token` header must carry a `dl_hash` claim that matches
+        class `admin-action` inputs `{action:"DECIDE_FRAUD",
+        resourceType:"case", resourceId:<caseId>, decision, notesHash}`
+        (`DYNAMIC_LINKING.md`). Server rejects mismatches with `403
+        urn:problem:dynamic-linking-mismatch`.
+
+        The backend atomically persists the decision and publishes the
+        downstream Kafka events:
+
+        - `CONFIRMED_FRAUD` → `fraud.decision-response=CONFIRMED_FRAUD`
+          + `account.freeze-commands reason=FRAUD_INVESTIGATION`, held
+          payment(s) REJECTED.
+        - `DISMISSED` → `fraud.decision-response=DISMISSED`, held
+          payment(s) released back into the clearing pipeline.
+
+        Notes are required (≥ 50 chars server-enforced). `notesHash` in
+        the dynamic-linking input is the SHA-256 of the NFC-normalised
+        notes (DYNAMIC_LINKING.md §"admin-action").
+      operationId: decideFraudCase
+      security:
+        - OAuth2Admin: [fraud:manage]
+      parameters:
+        - $ref: "#/components/parameters/CaseId"
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+        - $ref: "shared-schemas.yaml#/components/parameters/StepUpToken"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/FraudDecideRequest" }
+      responses:
+        "200":
+          description: Decision applied.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/FraudDecideAck" }
+        "401":
+          description: urn:problem:step-up-required
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+        "403":
+          description: urn:problem:dynamic-linking-mismatch
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+        "404": { $ref: "shared-schemas.yaml#/components/responses/Problem404" }
+        "409":
+          description: urn:problem:case-already-decided
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+        "422":
+          description: Notes too short (min 50 chars) or missing checkbox.
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+
+  /api/v1/admin/fraud/cases/bulk-decide:
+    post:
+      tags: [Fraud-Decide]
+      summary: Bulk decide up to 50 cases (UC-G31 AF-01, UC-G33 AF-05)
+      description: |
+        Processes a batch of cases with the same decision + shared notes.
+        Server rate-limits to 1 bulk action / 60 s / operator. Individual
+        cases that fail are reported in `results[]` with per-case status.
+
+        Step-up SCA required exactly once for the batch (covers the full
+        set); dynamic-linking `resourceType=case`, `resourceId` is the
+        bulk-op id (returned by a preceding `POST /bulk-decide/prepare`)
+        or the sorted-joined case-ids hash per the server's bulk-DL form.
+      operationId: bulkDecideFraudCases
+      security:
+        - OAuth2Admin: [fraud:manage]
+      parameters:
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+        - $ref: "shared-schemas.yaml#/components/parameters/StepUpToken"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/FraudBulkDecideRequest" }
+      responses:
+        "200":
+          description: Batch applied; per-case outcome in `results`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/FraudBulkDecideAck" }
+        "403":
+          description: urn:problem:dynamic-linking-mismatch
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+        "422":
+          description: Batch size > 50 or notes too short.
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+        "429":
+          description: urn:problem:concurrent-limit — bulk cooldown (60 s) not elapsed.
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+
+  #############################################################################
+  # SSE (UC-G31 AF-03 / AF-04)
+  #############################################################################
+  /api/v1/admin/fraud/cases/stream-token:
+    post:
+      tags: [Fraud-Stream]
+      summary: One-time SSE stream token
+      operationId: fraudStreamToken
+      security:
+        - OAuth2Admin: [fraud:read]
+      parameters:
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                caseId:
+                  description: Scope to a specific case (AF-03 / AF-04 banner).
+                  $ref: "shared-schemas.yaml#/components/schemas/Uuid"
+      responses:
+        "200":
+          description: Stream token.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [streamToken, expiresIn]
+                properties:
+                  streamToken: { type: string }
+                  expiresIn: { type: integer, example: 300 }
+
+  /api/v1/admin/fraud/cases/stream:
+    get:
+      tags: [Fraud-Stream]
+      summary: Live queue + case SSE (UC-G31 AF-03 / AF-04)
+      description: |
+        Events: `case.created`, `case.assigned`, `case.decided`,
+        `sla.breached`. Heartbeat 15 s. Single-use stream token per
+        SSE_CONVENTIONS.md.
+      operationId: fraudStream
+      parameters:
+        - name: token
+          in: query
+          required: true
+          schema: { type: string }
+        - name: Last-Event-ID
+          in: header
+          required: false
+          schema: { type: string }
+      responses:
+        "200":
+          description: text/event-stream
+          content:
+            text/event-stream:
+              schema: { type: string }
+
+components:
+  securitySchemes:
+    OAuth2Admin:
+      $ref: "shared-schemas.yaml#/components/securitySchemes/OAuth2Admin"
+
+  parameters:
+    CaseId:
+      name: caseId
+      in: path
+      required: true
+      schema: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+
+  schemas:
+    FraudCaseSummary:
+      type: object
+      required:
+        - caseId
+        - status
+        - score
+        - amount
+        - currency
+        - createdAt
+        - slaDeadline
+      properties:
+        caseId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+        status: { $ref: "shared-schemas.yaml#/components/schemas/FraudDecision" }
+        score:
+          type: number
+          minimum: 0
+          maximum: 1
+        scoreBand:
+          type: string
+          enum: [LOW, MEDIUM, HIGH]
+        amount: { $ref: "shared-schemas.yaml#/components/schemas/MonetaryAmount" }
+        currency: { $ref: "shared-schemas.yaml#/components/schemas/Currency" }
+        holderNameMasked:
+          type: string
+          description: |
+            Masked ("Ola N*****"). Operators with `accounts:admin:write`
+            reveal the full name via UC-G36.
+        debtorAccountId: { type: string }
+        creditorIbanMasked: { type: string }
+        triggeredRules:
+          type: array
+          description: Up to 3 top-contributing rule ids.
+          items: { type: string }
+          maxItems: 3
+        assignee:
+          type: string
+          description: Operator id, or `null` for unassigned.
+          nullable: true
+        createdAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        slaDeadline: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        slaBreached: { type: boolean }
+        paymentId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+
+    FraudCaseDetail:
+      allOf:
+        - $ref: "#/components/schemas/FraudCaseSummary"
+        - type: object
+          required: [scoreBreakdown, timeline, transaction]
+          properties:
+            transaction:
+              type: object
+              required: [paymentId, amount, currency]
+              properties:
+                paymentId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+                debtorIbanMasked: { type: string }
+                creditorIban: { $ref: "shared-schemas.yaml#/components/schemas/Iban" }
+                creditorName: { $ref: "shared-schemas.yaml#/components/schemas/Name" }
+                amount: { $ref: "shared-schemas.yaml#/components/schemas/MonetaryAmount" }
+                currency: { $ref: "shared-schemas.yaml#/components/schemas/Currency" }
+                reference: { type: string }
+                executionMode: { $ref: "shared-schemas.yaml#/components/schemas/ExecutionMode" }
+                initiatedAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+            scoreBreakdown:
+              type: object
+              properties:
+                sanctions:
+                  type: object
+                  properties:
+                    result:
+                      $ref: "shared-schemas.yaml#/components/schemas/SanctionsResult"
+                    matchedEntity:
+                      description: Present only when `result=HIT`.
+                      type: object
+                      additionalProperties: true
+                vop:
+                  type: object
+                  properties:
+                    result:
+                      $ref: "shared-schemas.yaml#/components/schemas/VoPResult"
+                    actualNameMasked:
+                      type: string
+                      description: |
+                        Present when VoP returned a name; masked. Full name
+                        via UC-G36 reveal only.
+                velocity:
+                  type: array
+                  items:
+                    type: object
+                    required: [ruleId, contribution]
+                    properties:
+                      ruleId: { type: string }
+                      contribution: { type: number }
+                      description: { type: string }
+                anomaly:
+                  type: object
+                  properties:
+                    score: { type: number }
+                    modelVersion: { type: string }
+                composite:
+                  type: number
+                  minimum: 0
+                  maximum: 1
+                threshold:
+                  type: number
+                  description: Score threshold that caused case creation.
+            timeline:
+              type: array
+              items: { $ref: "#/components/schemas/FraudTimelineEntry" }
+            heldPayments:
+              type: array
+              description: All payments currently HELD awaiting this case.
+              items:
+                type: object
+                required: [paymentId, amount, currency, status]
+                properties:
+                  paymentId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+                  amount: { $ref: "shared-schemas.yaml#/components/schemas/MonetaryAmount" }
+                  currency: { $ref: "shared-schemas.yaml#/components/schemas/Currency" }
+                  status: { $ref: "shared-schemas.yaml#/components/schemas/PaymentStatus" }
+            decision:
+              description: Present once the case is decided.
+              type: object
+              properties:
+                decidedBy: { type: string }
+                decidedAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+                decision:
+                  type: string
+                  enum: [CONFIRMED_FRAUD, DISMISSED]
+                notesSummary:
+                  type: string
+                  description: First 140 chars of the decision notes.
+                notesHash:
+                  type: string
+                  pattern: "^[0-9a-f]{64}$"
+
+    FraudTimelineEntry:
+      type: object
+      required: [at, type]
+      properties:
+        at: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        type:
+          type: string
+          enum:
+            - CASE_CREATED
+            - CASE_ASSIGNED
+            - CASE_VIEWED
+            - CASE_DECIDED
+            - PII_REVEALED
+            - SLA_BREACHED
+            - PAYMENT_HELD
+            - PAYMENT_RELEASED
+            - PAYMENT_REJECTED
+        actor:
+          description: Operator id or `system`.
+          type: string
+        note: { type: string, maxLength: 280 }
+
+    FraudCaseContext:
+      type: object
+      required: [windowDays, totalVolume, uniqueCounterparties]
+      properties:
+        windowDays: { type: integer, example: 30 }
+        totalVolume:
+          type: object
+          properties:
+            amount: { $ref: "shared-schemas.yaml#/components/schemas/MonetaryAmount" }
+            currency: { $ref: "shared-schemas.yaml#/components/schemas/Currency" }
+        uniqueCounterparties: { type: integer, minimum: 0 }
+        newBeneficiariesCount:
+          description: Counterparties first seen in the last 30 days.
+          type: integer
+          minimum: 0
+        avgTransactionSize:
+          type: object
+          properties:
+            amount: { $ref: "shared-schemas.yaml#/components/schemas/MonetaryAmount" }
+            currency: { $ref: "shared-schemas.yaml#/components/schemas/Currency" }
+        deviations:
+          type: array
+          description: Named deviation indicators (e.g. `AMOUNT_OUTLIER`).
+          items:
+            type: object
+            required: [indicator, severity]
+            properties:
+              indicator: { type: string }
+              severity:
+                type: string
+                enum: [LOW, MEDIUM, HIGH]
+              note: { type: string, maxLength: 280 }
+
+    FraudAssignRequest:
+      type: object
+      required: [assignee]
+      additionalProperties: false
+      properties:
+        assignee:
+          type: string
+          description: Operator id, `me`, or `unassigned`.
+        note: { type: string, maxLength: 280 }
+
+    FraudDecideRequest:
+      type: object
+      required: [decision, notes, confirmedCriteria]
+      additionalProperties: false
+      properties:
+        decision:
+          type: string
+          enum: [CONFIRMED_FRAUD, DISMISSED]
+        notes:
+          type: string
+          minLength: 50
+          maxLength: 2000
+          description: |
+            Operator's decision notes. Server stores NFC-normalised; client
+            computes `sha256(nfc(notes))` as `notesHash` input to the
+            dynamic-linking payload (DYNAMIC_LINKING.md §"admin-action").
+        confirmedCriteria:
+          type: boolean
+          description: |
+            Must be `true` — mirrors the required checkbox in the modal.
+            Server rejects `false` with `urn:problem:invalid-input`.
+        freezeReason:
+          description: |
+            Required when `decision=CONFIRMED_FRAUD`. Always
+            `FRAUD_INVESTIGATION` in UC-G32; included explicitly for audit
+            clarity and future extensibility.
+          $ref: "shared-schemas.yaml#/components/schemas/FreezeReason"
+
+    FraudDecideAck:
+      type: object
+      required: [caseId, status, decidedAt, affectedPayments]
+      properties:
+        caseId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+        status: { $ref: "shared-schemas.yaml#/components/schemas/FraudDecision" }
+        decidedAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        decidedBy: { type: string }
+        affectedPayments:
+          type: array
+          description: Payment ids the decision cascaded to.
+          items: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+        accountFrozen:
+          description: Set when `decision=CONFIRMED_FRAUD`.
+          type: object
+          properties:
+            accountId: { type: string }
+            freezeReason:
+              $ref: "shared-schemas.yaml#/components/schemas/FreezeReason"
+            freezeReference: { type: string }
+
+    FraudBulkDecideRequest:
+      type: object
+      required: [caseIds, decision, notes, confirmedCriteria]
+      additionalProperties: false
+      properties:
+        caseIds:
+          type: array
+          minItems: 1
+          maxItems: 50
+          items: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+        decision:
+          type: string
+          enum: [CONFIRMED_FRAUD, DISMISSED]
+          description: |
+            Same decision applied to every case in the batch. Mixed
+            decisions require separate calls.
+        notes:
+          type: string
+          minLength: 50
+          maxLength: 2000
+          description: Shared decision notes applied to every case.
+        confirmedCriteria: { type: boolean }
+        freezeReason:
+          $ref: "shared-schemas.yaml#/components/schemas/FreezeReason"
+
+    FraudBulkDecideAck:
+      type: object
+      required: [total, succeeded, failed, results]
+      properties:
+        total: { type: integer }
+        succeeded: { type: integer }
+        failed: { type: integer }
+        results:
+          type: array
+          items:
+            type: object
+            required: [caseId, outcome]
+            properties:
+              caseId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+              outcome:
+                type: string
+                enum: [APPLIED, ALREADY_DECIDED, NOT_FOUND, INTERNAL_ERROR]
+              errorKey:
+                type: string
+                description: Localised error-key when `outcome != APPLIED`.

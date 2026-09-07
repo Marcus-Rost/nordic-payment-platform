@@ -1,0 +1,500 @@
+openapi: 3.1.0
+info:
+  title: JRPay — Customer Mandates (AvtaleGiro)
+  version: 1.0.0
+  description: |
+    Customer-facing AvtaleGiro mandate management. Realises UC-G08
+    (create) and UC-G09 (list / modify / pause / revoke). AvtaleGiro is
+    Norway's domestic direct-debit scheme; this spec covers the consumer
+    side of the mandate lifecycle.
+
+    Hosted by A3 (bill-payment) and fronted by A4. Create and modify
+    require SCA with dynamic-linking class `mandate` bound to
+    `{mandateId, merchantId, maxAmount, currency, debtorAccountId}`
+    (`gui/architecture/DYNAMIC_LINKING.md`).
+
+    Revocation and pause do **not** require SCA per PSD2 / AvtaleGiro
+    customer-protective principle (UC-G09 §6.4, §6.5). Only the
+    creation-side lookups do not require SCA either.
+
+    See `shared-schemas.yaml` for enums + Problem envelope + pagination.
+
+servers:
+  - url: "https://api.{env}.jrpay.example"
+    variables: { env: { default: dev } }
+  - url: "http://localhost:8094"
+    description: Local dev
+
+tags:
+  - name: Mandate-Merchants
+    description: AvtaleGiro merchant registry lookup (UC-G08 §6 step 2)
+  - name: Mandates
+    description: Mandate lifecycle (UC-G08, UC-G09)
+
+paths:
+  #############################################################################
+  # Merchant lookup (UC-G08 §6 step 2)
+  #############################################################################
+  /api/v1/customer/mandates/merchants:
+    get:
+      tags: [Mandate-Merchants]
+      summary: Search the AvtaleGiro merchant registry
+      description: |
+        Autocomplete-friendly search over the AvtaleGiro merchant registry.
+        Matches against `displayName`, `tradingName`, and `avtaleId`
+        (7-digit AvtaleGiro identifier). Rate-limited to 30 / min / user.
+
+        The registry is a **cached projection** of the authoritative registry
+        maintained by Bits; staleness ≤ 24 h. Clients MUST NOT use this list
+        as authoritative for payee verification — UC-G08 §6 step 5 runs VoP
+        on the selected merchant's IBAN.
+      operationId: searchMerchants
+      security:
+        - OAuth2Customer: [mandates:manage]
+      parameters:
+        - name: q
+          in: query
+          required: true
+          description: Substring query, min 2 chars.
+          schema: { type: string, minLength: 2, maxLength: 140 }
+        - $ref: "shared-schemas.yaml#/components/parameters/PageSize"
+        - $ref: "shared-schemas.yaml#/components/parameters/AcceptLanguage"
+      responses:
+        "200":
+          description: Matching merchants.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/Merchant" }
+              examples:
+                hafslund:
+                  value:
+                    items:
+                      - merchantId: "m-bits-0001234"
+                        avtaleId: "0001234"
+                        displayName: "Hafslund Strøm AS"
+                        tradingName: "Hafslund Strøm"
+                        iban: "NO9386011117947"
+                        bic: "DNBANOKKXXX"
+                        acceptedFrequencies: [MONTHLY, ON_INVOICE]
+                        logoUrl: "https://cdn.jrpay.example/logos/hafslund.svg"
+        "429": { $ref: "shared-schemas.yaml#/components/responses/Problem429" }
+
+  /api/v1/customer/mandates/merchants/{merchantId}:
+    get:
+      tags: [Mandate-Merchants]
+      summary: Merchant detail by id
+      operationId: getMerchant
+      security:
+        - OAuth2Customer: [mandates:manage]
+      parameters:
+        - name: merchantId
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Merchant record.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Merchant" }
+        "404":
+          description: urn:problem:merchant-not-in-registry
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+
+  #############################################################################
+  # Mandate list + create (UC-G08)
+  #############################################################################
+  /api/v1/customer/mandates:
+    get:
+      tags: [Mandates]
+      summary: List mandates (UC-G09 §6.1)
+      operationId: listMandates
+      security:
+        - OAuth2Customer: [mandates:manage]
+      parameters:
+        - name: status
+          in: query
+          description: Filter by one or more mandate statuses. Default `ACTIVE,PAUSED`.
+          schema:
+            type: array
+            items: { $ref: "shared-schemas.yaml#/components/schemas/MandateStatus" }
+          style: form
+          explode: true
+        - name: merchantQuery
+          in: query
+          schema: { type: string }
+        - $ref: "shared-schemas.yaml#/components/parameters/PageNumber"
+        - $ref: "shared-schemas.yaml#/components/parameters/PageSize"
+        - $ref: "shared-schemas.yaml#/components/parameters/SortAsc"
+      responses:
+        "200":
+          description: Paginated mandate summaries.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, page]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/MandateSummary" }
+                  page: { $ref: "shared-schemas.yaml#/components/schemas/PageMeta" }
+    post:
+      tags: [Mandates]
+      summary: Create a mandate (UC-G08)
+      description: |
+        Creates a mandate in `PENDING_SCA` state. Response returns the
+        mandate-id, `scaSessionId`, and `dl_hash`; client runs UC-G51 and
+        receives a step-up token whose `dl_hash` claim binds it to
+        `{mandateId, merchantId, maxAmount, currency, debtorAccountId}`.
+
+        On `/sca/{sessionId}/verify` success, the mandate is automatically
+        transitioned to `ACTIVE` — no explicit follow-up endpoint needed.
+        A `202` response with `exempt=true` is emitted when PSD2 exemption
+        applies (rare for mandates — they are high-trust, usually
+        challenge-free for the mandate itself but require fresh SCA for
+        first-time merchants).
+      operationId: createMandate
+      security:
+        - OAuth2Customer: [mandates:manage]
+      parameters:
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/MandateCreateRequest" }
+      responses:
+        "201":
+          description: Mandate created; pending SCA.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MandatePendingSca" }
+        "400": { $ref: "shared-schemas.yaml#/components/responses/Problem400" }
+        "403": { $ref: "shared-schemas.yaml#/components/responses/Problem403" }
+        "404":
+          description: urn:problem:merchant-not-in-registry
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+        "409":
+          description: |
+            Duplicate active mandate with the same merchant (UC-G08 AF-05),
+            returned as `urn:problem:duplicate-consent` extension for
+            mandates, or `urn:problem:idempotency-key-conflict`.
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+        "422": { $ref: "shared-schemas.yaml#/components/responses/Problem422" }
+
+  /api/v1/customer/mandates/{mandateId}:
+    get:
+      tags: [Mandates]
+      summary: Mandate detail with execution history (UC-G09 §6.2)
+      operationId: getMandate
+      security:
+        - OAuth2Customer: [mandates:manage]
+      parameters:
+        - $ref: "#/components/parameters/MandateId"
+      responses:
+        "200":
+          description: Mandate detail.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MandateDetail" }
+        "404": { $ref: "shared-schemas.yaml#/components/responses/Problem404" }
+
+    patch:
+      tags: [Mandates]
+      summary: Modify mandate (max amount, pause / resume) — UC-G09 §6.3, §6.4
+      description: |
+        The only mutable properties are `maxAmount` (requires SCA, class
+        `mandate`) and `status` transitions between `ACTIVE` and `PAUSED`
+        (no SCA).
+
+        - Reducing max amount below the last executed debit is allowed but
+          returns the MandateDetail with a `warnings[]` entry so the UI
+          can surface UC-G09 AF-04 copy.
+        - Pausing with `resumeAt` schedules automatic resume (optional).
+        - Resuming a `PAUSED` mandate: send `{status: "ACTIVE"}`.
+      operationId: updateMandate
+      security:
+        - OAuth2Customer: [mandates:manage]
+      parameters:
+        - $ref: "#/components/parameters/MandateId"
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+        - $ref: "shared-schemas.yaml#/components/parameters/StepUpToken"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/MandateUpdateRequest" }
+      responses:
+        "200":
+          description: Mandate updated.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MandateDetail" }
+        "202":
+          description: Requires SCA (amount change).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MandatePendingSca" }
+        "400": { $ref: "shared-schemas.yaml#/components/responses/Problem400" }
+        "404": { $ref: "shared-schemas.yaml#/components/responses/Problem404" }
+        "409":
+          description: |
+            `urn:problem:pending-execution` — a debit is in-flight (UC-G09
+            AF-05). Customer retries after the debit settles.
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+        "422": { $ref: "shared-schemas.yaml#/components/responses/Problem422" }
+
+    delete:
+      tags: [Mandates]
+      summary: Revoke mandate (UC-G09 §6.5)
+      description: |
+        Revokes the mandate immediately. No SCA — customer-positive action
+        under PSD2. A `409 urn:problem:pending-execution` is returned when
+        a debit is currently in-flight; the customer retries once the debit
+        completes.
+      operationId: revokeMandate
+      security:
+        - OAuth2Customer: [mandates:manage]
+      parameters:
+        - $ref: "#/components/parameters/MandateId"
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+      responses:
+        "200":
+          description: Mandate revoked.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MandateDetail" }
+        "404": { $ref: "shared-schemas.yaml#/components/responses/Problem404" }
+        "409":
+          description: urn:problem:pending-execution
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+
+  /api/v1/customer/mandates/{mandateId}/executions:
+    get:
+      tags: [Mandates]
+      summary: Execution history for a mandate (UC-G09 §6.2)
+      description: |
+        Returns the ordered list of past debits under this mandate, each
+        linking to the ledger transaction (via `transactionId`) so the UI
+        can deep-link to UC-G03.
+      operationId: listMandateExecutions
+      security:
+        - OAuth2Customer: [mandates:manage]
+      parameters:
+        - $ref: "#/components/parameters/MandateId"
+        - $ref: "shared-schemas.yaml#/components/parameters/PageNumber"
+        - $ref: "shared-schemas.yaml#/components/parameters/PageSize"
+      responses:
+        "200":
+          description: Paginated executions (newest first).
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, page]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/MandateExecution" }
+                  page: { $ref: "shared-schemas.yaml#/components/schemas/PageMeta" }
+
+components:
+  securitySchemes:
+    OAuth2Customer:
+      $ref: "shared-schemas.yaml#/components/securitySchemes/OAuth2Customer"
+
+  parameters:
+    MandateId:
+      name: mandateId
+      in: path
+      required: true
+      schema: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+
+  schemas:
+    Merchant:
+      type: object
+      required: [merchantId, avtaleId, displayName, iban, acceptedFrequencies]
+      properties:
+        merchantId:
+          type: string
+          description: Stable registry-scoped merchant id (opaque).
+        avtaleId:
+          type: string
+          pattern: "^[0-9]{7}$"
+          description: The 7-digit AvtaleGiro identifier merchants print on invoices.
+        displayName: { $ref: "shared-schemas.yaml#/components/schemas/Name" }
+        tradingName: { $ref: "shared-schemas.yaml#/components/schemas/Name" }
+        iban: { $ref: "shared-schemas.yaml#/components/schemas/Iban" }
+        bic: { $ref: "shared-schemas.yaml#/components/schemas/Bic" }
+        logoUrl: { type: string, format: uri }
+        acceptedFrequencies:
+          type: array
+          items: { $ref: "shared-schemas.yaml#/components/schemas/MandateFrequency" }
+        registryUpdatedAt:
+          $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant"
+
+    MandateSummary:
+      type: object
+      required:
+        - mandateId
+        - merchantId
+        - merchantName
+        - debtorAccountId
+        - maxAmount
+        - currency
+        - frequency
+        - status
+        - startDate
+      properties:
+        mandateId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+        merchantId: { type: string }
+        merchantName: { $ref: "shared-schemas.yaml#/components/schemas/Name" }
+        merchantLogoUrl: { type: string, format: uri }
+        debtorAccountId: { type: string }
+        maxAmount: { $ref: "shared-schemas.yaml#/components/schemas/MonetaryAmount" }
+        currency: { $ref: "shared-schemas.yaml#/components/schemas/Currency" }
+        frequency: { $ref: "shared-schemas.yaml#/components/schemas/MandateFrequency" }
+        status: { $ref: "shared-schemas.yaml#/components/schemas/MandateStatus" }
+        startDate: { $ref: "shared-schemas.yaml#/components/schemas/LocalDate" }
+        endDate: { $ref: "shared-schemas.yaml#/components/schemas/LocalDate" }
+        lastExecutedAt:
+          $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant"
+        nextExpectedAt:
+          $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant"
+        resumeAt:
+          description: Present only when `status=PAUSED` and auto-resume scheduled.
+          $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant"
+
+    MandateDetail:
+      allOf:
+        - $ref: "#/components/schemas/MandateSummary"
+        - type: object
+          properties:
+            avtaleId:
+              type: string
+              pattern: "^[0-9]{7}$"
+            notifyBeforeDebit:
+              type: boolean
+              description: |
+                Default `true`. When enabled, customer receives a
+                `MANDATE_PRE_DEBIT` notification 3 days before each expected
+                debit (UC-G08 §6 step 4).
+            createdAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+            updatedAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+            revokedAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+            warnings:
+              type: array
+              description: |
+                Non-fatal advisories returned by the server after a
+                modification (e.g., new max below last debit — UC-G09 AF-04).
+              items:
+                type: object
+                required: [code, message]
+                properties:
+                  code:
+                    type: string
+                    enum:
+                      - MAX_BELOW_LAST_DEBIT
+                      - END_DATE_BEFORE_NEXT_EXPECTED
+                      - FREQUENCY_CHANGED_BY_MERCHANT
+                  message: { type: string, maxLength: 280 }
+
+    MandatePendingSca:
+      type: object
+      required: [mandateId, scaSessionId, dl_hash]
+      properties:
+        mandateId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+        scaSessionId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+        dl_hash:
+          type: string
+          description: SCA dynamic-linking hash (class `mandate`).
+          pattern: "^[0-9a-f]{64}$"
+        exempt: { type: boolean }
+        stepUpToken: { type: string }
+        challenge:
+          type: object
+          additionalProperties: true
+
+    MandateCreateRequest:
+      type: object
+      required: [merchantId, debtorAccountId, maxAmount, currency, startDate]
+      additionalProperties: false
+      properties:
+        merchantId: { type: string }
+        debtorAccountId: { type: string }
+        maxAmount:
+          description: Strictly > 0 (UC-G08 AF-04 forbids 0 / negative).
+          $ref: "shared-schemas.yaml#/components/schemas/MonetaryAmount"
+        currency: { $ref: "shared-schemas.yaml#/components/schemas/Currency" }
+        frequency:
+          description: |
+            If the merchant registry states a fixed frequency, this is
+            optional (server uses the registry value). If the merchant
+            allows multiple frequencies, the customer picks.
+          $ref: "shared-schemas.yaml#/components/schemas/MandateFrequency"
+        startDate:
+          description: Must be ≥ today and ≤ today + 6 months (UC-G08 §6 step 4).
+          $ref: "shared-schemas.yaml#/components/schemas/LocalDate"
+        endDate:
+          description: Optional. Must be strictly after `startDate` (UC-G08 AF-03).
+          $ref: "shared-schemas.yaml#/components/schemas/LocalDate"
+        notifyBeforeDebit:
+          type: boolean
+          default: true
+
+    MandateUpdateRequest:
+      type: object
+      additionalProperties: false
+      description: |
+        Body must include at least one of `maxAmount`, `status`,
+        `notifyBeforeDebit`, `resumeAt`. Only `maxAmount` triggers SCA;
+        others are customer-positive and accepted synchronously.
+      properties:
+        maxAmount: { $ref: "shared-schemas.yaml#/components/schemas/MonetaryAmount" }
+        status:
+          type: string
+          enum: [ACTIVE, PAUSED]
+          description: |
+            Only `ACTIVE ↔ PAUSED` transitions. To revoke use `DELETE`.
+            Attempting `REVOKED` / `EXPIRED` returns `400`.
+        resumeAt:
+          description: Optional auto-resume instant when pausing.
+          $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant"
+        notifyBeforeDebit: { type: boolean }
+
+    MandateExecution:
+      type: object
+      required: [executionId, mandateId, amount, currency, status, attemptedAt]
+      properties:
+        executionId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+        mandateId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+        amount: { $ref: "shared-schemas.yaml#/components/schemas/MonetaryAmount" }
+        currency: { $ref: "shared-schemas.yaml#/components/schemas/Currency" }
+        status: { $ref: "shared-schemas.yaml#/components/schemas/PaymentStatus" }
+        attemptedAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        settledAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        transactionId:
+          description: Ledger transaction id (deep-link to UC-G03).
+          $ref: "shared-schemas.yaml#/components/schemas/Uuid"
+        rejectionReason:
+          $ref: "shared-schemas.yaml#/components/schemas/CustomerVisibleRejectionReason"
+        invoiceReference:
+          type: string
+          maxLength: 140

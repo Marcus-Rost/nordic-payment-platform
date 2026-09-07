@@ -1,0 +1,17 @@
+{
+  "name": "jrpay-api-specs",
+  "version": "1.0.0",
+  "private": true,
+  "description": "JRPay OpenAPI contracts — specs, Spectral ruleset, cross-file validator. Not a runtime package.",
+  "scripts": {
+    "lint": "spectral lint --fail-severity=error '*.yaml'",
+    "lint:warn": "spectral lint --fail-severity=warn '*.yaml'",
+    "lint:all": "spectral lint '*.yaml'",
+    "validate": "python3 scripts/validate_cross_refs.py"
+  },
+  "devDependencies": {
+    "@stoplight/spectral-cli": "^6.15.0",
+    "@stoplight/spectral-core": "^1.19.0",
+    "@stoplight/spectral-functions": "^1.9.0"
+  }
+}

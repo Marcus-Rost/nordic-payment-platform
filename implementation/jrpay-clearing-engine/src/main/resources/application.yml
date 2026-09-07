@@ -1,0 +1,36 @@
+spring:
+  application:
+    name: jrpay-clearing-engine
+
+  datasource:
+    url: jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5442}/clearing
+    username: ${DB_USER:clearing}
+    password: ${DB_PASSWORD:clearing}
+
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    open-in-view: false
+
+  flyway:
+    enabled: true
+
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP:localhost:9092}
+
+server:
+  port: 8092
+
+management:
+  server:
+    port: 9082
+  endpoints:
+    web:
+      exposure:
+        include: health,readiness,prometheus
+
+jrpay:
+  clearing:
+    instant:
+      max-amount: 100000
+      hard-limit-seconds: 7

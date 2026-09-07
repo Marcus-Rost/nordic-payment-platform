@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Simple "JR" wordmark on a navy background — replaced with a real
+         brand mark before app-store submission. -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M40,32 L40,68 Q40,76 32,76 Q26,76 26,70 L34,70 Q34,72 32,72 Q34,72 34,70 L34,32 Z" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M58,32 L58,76 L66,76 L66,58 L72,58 L80,76 L88,76 L80,56 Q86,53 86,46 Q86,32 72,32 Z M66,38 L72,38 Q78,38 78,46 Q78,52 72,52 L66,52 Z" />
+</vector>

@@ -1,0 +1,147 @@
+{
+    "app": {
+        "title": "JRPay Admin",
+        "subtitle": "Operator console"
+    },
+    "common": {
+        "cancel": "Cancel",
+        "confirm": "Confirm",
+        "save": "Save",
+        "search": "Search",
+        "loading": "Loading …",
+        "retry": "Retry",
+        "close": "Close",
+        "actions": "Actions",
+        "details": "Details",
+        "page": "Page",
+        "of": "of",
+        "next": "Next",
+        "prev": "Previous",
+        "yes": "Yes",
+        "no": "No",
+        "logout": "Logout",
+        "language": "Language"
+    },
+    "login": {
+        "title": "Sign in",
+        "subtitle": "Sign in with BankID to open the operator console.",
+        "continueWithBankId": "Continue with BankID",
+        "redirecting": "Redirecting …",
+        "scaNotice": "Mutations require step-up SCA per UC-G51."
+    },
+    "callback": {
+        "exchanging": "Exchanging code for token …",
+        "pleaseWait": "One moment.",
+        "failed": "Sign-in failed",
+        "tryAgain": "Back to sign-in"
+    },
+    "session": {
+        "expiringTitle": "Session expiring soon",
+        "expiringBody": "Your session expires in {{minutes}}:{{seconds}}. Re-authenticate to continue.",
+        "reauthenticate": "Re-authenticate",
+        "dismiss": "Got it"
+    },
+    "sca": {
+        "title": "Step-up authentication",
+        "description": "Confirm the action with your SCA factor.",
+        "initiating": "Starting SCA session …",
+        "factor": "Factor: {{type}}",
+        "codeLabel": "6-digit code",
+        "verify": "Verify",
+        "verifying": "Verifying …"
+    },
+    "nav": {
+        "dashboard": "Dashboard",
+        "fraud": "Fraud cases",
+        "sanctions": "Sanctions hits",
+        "accounts": "Accounts",
+        "audit": "Audit log",
+        "users": "Operators",
+        "system": "System"
+    },
+    "fraud": {
+        "queueTitle": "Fraud queue",
+        "openTotal": "Open cases",
+        "assignedToMe": "Assigned to me",
+        "slaBreached": "Past SLA",
+        "score": "Score",
+        "amount": "Amount",
+        "creditor": "Creditor",
+        "rules": "Rules",
+        "assignee": "Assignee",
+        "createdAt": "Received",
+        "sla": "SLA",
+        "case": "Case",
+        "viewCase": "View case",
+        "decideCase": "Decide",
+        "confirmFraud": "Confirm fraud",
+        "dismiss": "Dismiss",
+        "selfAssign": "Assign to me",
+        "unassign": "Release",
+        "decideTitle": "Decide case",
+        "decideNotesLabel": "Decision notes (≥ 50 characters)",
+        "decideNotesHint": "Notes are bound into the SCA proof.",
+        "confirmedCriteria": "I confirm I have evaluated the criteria.",
+        "decideSubmit": "Confirm and sign"
+    },
+    "sanctions": {
+        "queueTitle": "Sanctions hits",
+        "matchedEntity": "Matched entity",
+        "matchedList": "List",
+        "matchScore": "Score",
+        "decideTitle": "Decide hit",
+        "outcomeConfirmed": "Confirm sanction",
+        "outcomeFalsePositive": "False positive",
+        "outcomeReleaseForFraud": "Release for fraud review",
+        "addToFpCache": "Add to FP cache (90 days)",
+        "listsTitle": "Sanctions lists",
+        "fpCacheTitle": "False-positive cache"
+    },
+    "accounts": {
+        "searchTitle": "Account search",
+        "modeName": "Name",
+        "modeIban": "IBAN",
+        "modeFnr": "Fødselsnummer",
+        "noResults": "No results",
+        "freeze": "Freeze",
+        "unfreeze": "Unfreeze",
+        "close": "Close",
+        "createAccount": "Create account",
+        "revealPii": "Reveal PII",
+        "freezeReason": "Reason",
+        "freezeReference": "External reference (optional)",
+        "freezeNotes": "Notes (≥ 50 characters)",
+        "confirmedCriteria": "I confirm the criteria are met."
+    },
+    "pii": {
+        "title": "Reveal {{field}}",
+        "justificationLabel": "Business justification (≥ 20 characters)",
+        "confirmBusinessNeed": "I confirm I have a business need.",
+        "ttlRemaining": "Re-masks in {{seconds}} s.",
+        "extend": "Extend (+60 s)",
+        "remask": "Re-mask now",
+        "extensionsRemaining": "{{count}} extensions remaining",
+        "pendingApproval": "Awaiting SUPERVISOR approval ({{ref}})"
+    },
+    "audit": {
+        "searchTitle": "Search audit log",
+        "type": "Event type",
+        "actor": "Actor",
+        "resource": "Resource",
+        "verifyChain": "Verify hash chain"
+    },
+    "system": {
+        "title": "System health",
+        "service": "Service",
+        "status": "Status",
+        "up": "UP",
+        "down": "DOWN"
+    },
+    "users": {
+        "title": "Operator administration",
+        "create": "Create operator",
+        "suspend": "Suspend",
+        "reactivate": "Reactivate",
+        "delete": "Delete"
+    }
+}

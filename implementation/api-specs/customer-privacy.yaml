@@ -1,0 +1,349 @@
+openapi: 3.1.0
+info:
+  title: JRPay — Customer Privacy (Consent Log)
+  version: 1.0.0
+  description: |
+    Customer-facing consent-log / privacy surface. Realises UC-G26
+    (consent log review) and supplements the privacy-notice surface in
+    `identity.yaml` (UC-G45).
+
+    The consent log is a read-only chronological view — PSD2 / VRP
+    grants + revocations + expirations + renewals, marketing opt-in /
+    opt-out, notification-preference changes (UC-G21 cascade),
+    informed-consent acceptances (UC-G25 §6.3), cookie-consent events
+    for the web GUI. GDPR Art. 7(1) evidence of consent; Art. 15(1)(c)
+    "recipients of the data".
+
+    Data comes from the new `jrpay-audit-query` projection service
+    (Phase 2H) filtered by `customer-id`. GDPR Art. 15 "machine-
+    readable" requirement is satisfied by the CSV export endpoint
+    (same signed-URL pattern as UC-G04).
+
+    Session / active-device view and privacy notice acceptance live in
+    `identity.yaml` (UC-G45 + UC-G53); this spec does not duplicate them.
+
+    See `shared-schemas.yaml` for enums + Problem envelope + pagination.
+
+servers:
+  - url: "https://api.{env}.jrpay.example"
+    variables: { env: { default: dev } }
+  - url: "http://localhost:8099"
+    description: Local dev (jrpay-audit-query module)
+
+tags:
+  - name: ConsentLog
+    description: UC-G26 — browse + expand + filter
+  - name: ConsentLogExport
+    description: UC-G26 §6 step 6 — CSV export (signed URL)
+
+paths:
+  /api/v1/customer/consent-log:
+    get:
+      tags: [ConsentLog]
+      summary: Browse the consent log (UC-G26 §6 step 2)
+      description: |
+        Paginated, filterable, chronological list. Default range is last
+        12 months (UC-G26 AF-05); requests that span > 12 months run as
+        async (server returns `202` with a tracking id; customer is
+        notified when ready and the result appears in a new export
+        request).
+
+        All rows are read-only from the customer's perspective. A
+        `read.consent-log` audit event is emitted on every list call
+        (self-audit — UC-G26 §5).
+      operationId: listConsentLog
+      security:
+        - OAuth2Customer: []
+      parameters:
+        - name: from
+          in: query
+          schema: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        - name: to
+          in: query
+          schema: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        - name: category
+          in: query
+          description: Multi-value filter.
+          schema:
+            type: array
+            items: { $ref: "shared-schemas.yaml#/components/schemas/ConsentLogCategory" }
+          style: form
+          explode: true
+        - name: type
+          in: query
+          schema:
+            type: array
+            items: { $ref: "shared-schemas.yaml#/components/schemas/ConsentLogType" }
+          style: form
+          explode: true
+        - name: counterparty
+          in: query
+          description: Substring on counterparty name (TPP, merchant, internal).
+          schema: { type: string, maxLength: 140 }
+        - name: initiatedBy
+          in: query
+          schema:
+            type: array
+            items:
+              type: string
+              enum: [CUSTOMER, TPP, SYSTEM]
+          style: form
+          explode: true
+        - $ref: "shared-schemas.yaml#/components/parameters/PageNumber"
+        - $ref: "shared-schemas.yaml#/components/parameters/PageSize"
+        - $ref: "shared-schemas.yaml#/components/parameters/SortAsc"
+        - $ref: "shared-schemas.yaml#/components/parameters/AcceptLanguage"
+      responses:
+        "200":
+          description: Paginated consent-log rows.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, page]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/ConsentLogEntry" }
+                  page: { $ref: "shared-schemas.yaml#/components/schemas/PageMeta" }
+              examples:
+                threeEntries:
+                  value:
+                    items:
+                      - eventId: "01HZ1Z2E3K4Q5R6S7T8V9W0X1Y"
+                        timestamp: "2026-03-01T09:15:00.000Z"
+                        type: CONSENT_GRANTED
+                        category: PSD2_AIS
+                        counterparty: "Fiken AS"
+                        scopes: [accounts:read, transactions:read]
+                        accounts: ["a-0001", "a-0002"]
+                        outcome: SUCCESS
+                        initiatedBy: CUSTOMER
+                      - eventId: "01HZ24R4N3PQ8XKE2QDFF70M7C"
+                        timestamp: "2026-02-28T18:22:11.000Z"
+                        type: MARKETING_OPTED_OUT
+                        category: MARKETING
+                        counterparty: internal
+                        outcome: SUCCESS
+                        initiatedBy: CUSTOMER
+                      - eventId: "01HZ1YD6B3VZKC59DK5G9FVEV0"
+                        timestamp: "2026-02-27T12:05:00.000Z"
+                        type: COOKIE_CONSENT_UPDATED
+                        category: COOKIE
+                        counterparty: internal
+                        outcome: SUCCESS
+                        initiatedBy: CUSTOMER
+                        details:
+                          preferences:
+                            essential: true
+                            performance: false
+                            marketing: false
+                    page: { page: 0, size: 25, totalElements: 3, totalPages: 1 }
+        "202":
+          description: |
+            Range spans > 12 months — running as async (UC-G26 AF-05).
+            Track the resulting export using the returned `requestId`.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [requestId, estimatedReady]
+                properties:
+                  requestId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+                  estimatedReady: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+
+  /api/v1/customer/consent-log/{eventId}:
+    get:
+      tags: [ConsentLog]
+      summary: Consent-log entry detail (UC-G26 AF-03)
+      description: |
+        Full event payload + plain-language summary + status-at-expansion
+        links. The detail includes the localised "What this means"
+        paragraph key per event type (UC-G26 §12).
+      operationId: getConsentLogEntry
+      security:
+        - OAuth2Customer: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema: { $ref: "shared-schemas.yaml#/components/schemas/Ulid" }
+        - $ref: "shared-schemas.yaml#/components/parameters/AcceptLanguage"
+      responses:
+        "200":
+          description: Detail.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ConsentLogEntryDetail" }
+        "404": { $ref: "shared-schemas.yaml#/components/responses/Problem404" }
+
+  #############################################################################
+  # CSV export (UC-G26 §6 step 6)
+  #############################################################################
+  /api/v1/customer/consent-log/export:
+    post:
+      tags: [ConsentLogExport]
+      summary: Request a CSV export of the filtered consent log
+      description: |
+        Produces a CSV of the consent-log filtered set. Download is via
+        a 10-minute single-use signed URL per `SIGNED_URL_CONVENTIONS.md`
+        (same TTL as statements — customer is interactive).
+      operationId: requestConsentLogExport
+      security:
+        - OAuth2Customer: []
+      parameters:
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ConsentLogExportRequest" }
+      responses:
+        "200":
+          description: Synchronous (small) — signed URL ready.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [requestId, downloadUrl, expiresAt]
+                properties:
+                  requestId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+                  downloadUrl: { type: string, format: uri }
+                  expiresAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        "202":
+          description: Async (large range) — poll for status.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [requestId, estimatedReady]
+                properties:
+                  requestId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+                  estimatedReady: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        "429": { $ref: "shared-schemas.yaml#/components/responses/Problem429" }
+
+  /api/v1/customer/consent-log/export/{requestId}:
+    get:
+      tags: [ConsentLogExport]
+      summary: Poll export status
+      operationId: getConsentLogExport
+      security:
+        - OAuth2Customer: []
+      parameters:
+        - name: requestId
+          in: path
+          required: true
+          schema: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+      responses:
+        "200":
+          description: Status.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status:
+                    type: string
+                    enum: [PENDING, IN_PROGRESS, READY, FAILED, EXPIRED, CANCELLED]
+                  progress:
+                    type: integer
+                    minimum: 0
+                    maximum: 100
+                  downloadUrl: { type: string, format: uri }
+                  expiresAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        "404": { $ref: "shared-schemas.yaml#/components/responses/Problem404" }
+
+components:
+  securitySchemes:
+    OAuth2Customer:
+      $ref: "shared-schemas.yaml#/components/securitySchemes/OAuth2Customer"
+
+  schemas:
+    ConsentLogEntry:
+      type: object
+      required: [eventId, timestamp, type, category, outcome, initiatedBy]
+      properties:
+        eventId: { $ref: "shared-schemas.yaml#/components/schemas/Ulid" }
+        timestamp: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        type: { $ref: "shared-schemas.yaml#/components/schemas/ConsentLogType" }
+        category: { $ref: "shared-schemas.yaml#/components/schemas/ConsentLogCategory" }
+        counterparty:
+          type: string
+          description: |
+            TPP name, merchant name, or the literal string `internal` for
+            bank-originated events (preferences, notice acceptance, cookie
+            updates).
+          maxLength: 140
+        scopes:
+          description: PSD2 scopes or VRP permission strings. Sorted lexicographically.
+          type: array
+          items: { type: string }
+        accounts:
+          description: Affected account ids. Sorted lexicographically.
+          type: array
+          items: { type: string }
+        outcome:
+          type: string
+          enum: [SUCCESS, DENIED, CANCELLED, EXPIRED]
+        initiatedBy:
+          type: string
+          enum: [CUSTOMER, TPP, SYSTEM]
+        details:
+          type: object
+          additionalProperties: true
+          description: |
+            Type-specific payload. Examples:
+              - `COOKIE_CONSENT_UPDATED` → `{preferences: {essential, performance, marketing}}`
+              - `NOTIFICATION_PREF_CHANGED` → `{diff: [...]}` (truncated to what the customer actually changed)
+              - `CONSENT_RENEWED` → `{priorConsentId, newConsentId}`
+
+    ConsentLogEntryDetail:
+      allOf:
+        - $ref: "#/components/schemas/ConsentLogEntry"
+        - type: object
+          properties:
+            humanSummaryKey:
+              type: string
+              description: |
+                i18n key for the plain-language "What this means" paragraph
+                (UC-G26 §12). Localised by `Accept-Language`.
+            linkToActiveConsent:
+              description: |
+                Present on `CONSENT_GRANTED` entries whose consent is still
+                ACTIVE; deep-links to UC-G18 detail for the consent.
+              type: object
+              properties:
+                consentId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+                kind:
+                  type: string
+                  enum: [PSD2, VRP]
+            rawEvent:
+              type: object
+              description: |
+                Raw audit event payload as projected by `jrpay-audit-query`,
+                PII-masked identically to the admin audit surface (UC-G35
+                §12). Expanded under a "Show raw" affordance in the UI.
+              additionalProperties: true
+
+    ConsentLogExportRequest:
+      type: object
+      additionalProperties: false
+      description: |
+        Echoes the same filters as `GET /consent-log`; server re-runs the
+        query and streams the result into a CSV file.
+      properties:
+        from: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        to: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        category:
+          type: array
+          items: { $ref: "shared-schemas.yaml#/components/schemas/ConsentLogCategory" }
+        type:
+          type: array
+          items: { $ref: "shared-schemas.yaml#/components/schemas/ConsentLogType" }
+        counterparty: { type: string, maxLength: 140 }
+        initiatedBy:
+          type: array
+          items:
+            type: string
+            enum: [CUSTOMER, TPP, SYSTEM]

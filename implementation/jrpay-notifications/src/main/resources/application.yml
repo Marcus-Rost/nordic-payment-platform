@@ -1,0 +1,67 @@
+spring:
+  application:
+    name: jrpay-notifications
+
+  datasource:
+    url: jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5432}/notifications
+    username: ${DB_USER:jrpay}
+    password: ${DB_PASSWORD:jrpay}
+    hikari:
+      maximum-pool-size: 10
+      minimum-idle: 5
+      connection-timeout: 5000
+
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    open-in-view: false
+    properties:
+      hibernate.jdbc.time_zone: UTC
+
+  flyway:
+    enabled: true
+
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP:localhost:9092}
+    consumer:
+      group-id: jrpay-notifications
+      auto-offset-reset: earliest
+      enable-auto-commit: false
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      properties:
+        spring.json.trusted.packages: "*"
+    listener:
+      ack-mode: MANUAL_IMMEDIATE
+      missing-topics-fatal: false
+
+server:
+  port: 8098
+
+management:
+  server:
+    port: 9098
+  endpoints:
+    web:
+      exposure:
+        include: health,readiness,prometheus
+
+jrpay:
+  notifications:
+    sse:
+      stream-token-ttl: PT5M
+      heartbeat-interval: PT15S
+      replay-window: PT5M
+    inbox:
+      max-page-size: 500
+      retain-deleted-days: 30
+    kafka:
+      topics:
+        payment-status-updates: payment.status-updates
+        fraud-decisions: fraud.decision-response
+        sanctions-decisions: sanctions.decision
+        consent-events: consent.events
+        mandate-pre-debit: mandate.pre-debit
+    rate-limits:
+      email-resend-per-hour: 3
+      phone-resend-per-hour: 3

@@ -1,0 +1,417 @@
+openapi: 3.1.0
+info:
+  title: JRPay — Customer Accounts
+  version: 1.0.0
+  description: |
+    Customer-facing account, balance, transaction, and statement endpoints.
+    Realises UC-G02, UC-G03, UC-G04.
+
+    Hosted by A4 (PSD2 API) which proxies to A1 (ledger) on the customer's
+    behalf, scoped by the access token's `sub` and the customer↔account map.
+
+    See `shared-schemas.yaml` for enums + Problem detail + pagination.
+
+servers:
+  - url: "https://api.{env}.jrpay.example"
+    variables: { env: { default: dev } }
+  - url: "http://localhost:8094"
+    description: Local dev (A4 port)
+
+tags:
+  - name: Accounts
+    description: UC-G02 dashboard, UC-G03 detail
+  - name: Transactions
+    description: UC-G03 history + detail
+  - name: Statements
+    description: UC-G04 PDF / JSON / camt.053 export
+
+paths:
+  /api/v1/customer/accounts:
+    get:
+      tags: [Accounts]
+      summary: List the customer's accounts (UC-G02)
+      operationId: listAccounts
+      security:
+        - OAuth2Customer: [accounts:read]
+      parameters:
+        - $ref: "shared-schemas.yaml#/components/parameters/AcceptLanguage"
+        - $ref: "shared-schemas.yaml#/components/parameters/TraceParent"
+      responses:
+        "200":
+          description: Array of accounts for the authenticated customer.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/AccountSummary" }
+              examples:
+                twoAccounts:
+                  value:
+                    - accountId: "a-0001"
+                      iban: "NO9386011117947"
+                      type: CHECKING
+                      currency: NOK
+                      bookedBalance: "12345.67"
+                      reservedAmount: "250.00"
+                      availableBalance: "12095.67"
+                      status: ACTIVE
+                      nickname: Hovedkonto
+                      primary: true
+                    - accountId: "a-0002"
+                      iban: "NO9386011118018"
+                      type: SAVINGS
+                      currency: NOK
+                      bookedBalance: "50000.00"
+                      reservedAmount: "0.00"
+                      availableBalance: "50000.00"
+                      status: ACTIVE
+                      nickname: Sparing
+                      primary: false
+        "401": { $ref: "shared-schemas.yaml#/components/responses/Problem401" }
+        "403": { $ref: "shared-schemas.yaml#/components/responses/Problem403" }
+        "429": { $ref: "shared-schemas.yaml#/components/responses/Problem429" }
+
+  /api/v1/customer/accounts/{accountId}:
+    get:
+      tags: [Accounts]
+      summary: Account detail (UC-G03 header)
+      operationId: getAccount
+      security:
+        - OAuth2Customer: [accounts:read]
+      parameters:
+        - $ref: "#/components/parameters/AccountId"
+      responses:
+        "200":
+          description: Account detail.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AccountDetail" }
+        "404": { $ref: "shared-schemas.yaml#/components/responses/Problem404" }
+
+  /api/v1/customer/accounts/{accountId}/balances:
+    get:
+      tags: [Accounts]
+      summary: Balances for an account
+      operationId: getAccountBalances
+      security:
+        - OAuth2Customer: [accounts:read]
+      parameters:
+        - $ref: "#/components/parameters/AccountId"
+      responses:
+        "200":
+          description: Balance breakdown.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Balances" }
+
+  /api/v1/customer/accounts/{accountId}/transactions:
+    get:
+      tags: [Transactions]
+      summary: Transaction history (UC-G03 list)
+      operationId: listTransactions
+      security:
+        - OAuth2Customer: [transactions:read]
+      parameters:
+        - $ref: "#/components/parameters/AccountId"
+        - $ref: "shared-schemas.yaml#/components/parameters/PageNumber"
+        - $ref: "shared-schemas.yaml#/components/parameters/PageSize"
+        - $ref: "shared-schemas.yaml#/components/parameters/SortAsc"
+        - name: from
+          in: query
+          schema: { $ref: "shared-schemas.yaml#/components/schemas/LocalDate" }
+        - name: to
+          in: query
+          schema: { $ref: "shared-schemas.yaml#/components/schemas/LocalDate" }
+        - name: amountMin
+          in: query
+          schema: { $ref: "shared-schemas.yaml#/components/schemas/MonetaryAmount" }
+        - name: amountMax
+          in: query
+          schema: { $ref: "shared-schemas.yaml#/components/schemas/MonetaryAmount" }
+        - name: counterparty
+          in: query
+          description: Free-text substring match on counterparty name.
+          schema: { type: string }
+        - name: counterpartyIban
+          in: query
+          description: Exact IBAN match.
+          schema: { $ref: "shared-schemas.yaml#/components/schemas/Iban" }
+        - name: reference
+          in: query
+          description: Substring match on reference / KID.
+          schema: { type: string }
+      responses:
+        "200":
+          description: Paginated transaction summaries.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, page]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/TransactionSummary" }
+                  page: { $ref: "shared-schemas.yaml#/components/schemas/PageMeta" }
+
+  /api/v1/customer/transactions/{transactionId}:
+    get:
+      tags: [Transactions]
+      summary: Transaction detail (UC-G03 sheet)
+      operationId: getTransaction
+      security:
+        - OAuth2Customer: [transactions:read]
+      parameters:
+        - name: transactionId
+          in: path
+          required: true
+          schema: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+      responses:
+        "200":
+          description: Full transaction.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TransactionDetail" }
+        "404": { $ref: "shared-schemas.yaml#/components/responses/Problem404" }
+
+  /api/v1/customer/transactions/{transactionId}/receipt.pdf:
+    get:
+      tags: [Transactions]
+      summary: Download receipt PDF (UC-G03)
+      operationId: getTransactionReceipt
+      security:
+        - OAuth2Customer: [transactions:read]
+      parameters:
+        - name: transactionId
+          in: path
+          required: true
+          schema: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+      responses:
+        "302":
+          description: |
+            Redirect to a signed-URL per SIGNED_URL_CONVENTIONS.md (5-min TTL).
+          headers:
+            Location:
+              schema: { type: string, format: uri }
+
+  /api/v1/customer/accounts/{accountId}/statements:
+    post:
+      tags: [Statements]
+      summary: Request a statement export (UC-G04)
+      operationId: requestStatement
+      security:
+        - OAuth2Customer: [transactions:read]
+      parameters:
+        - $ref: "#/components/parameters/AccountId"
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/StatementRequest" }
+      responses:
+        "200":
+          description: Synchronous (small) result — signed download URL.
+          headers:
+            Location:
+              schema: { type: string, format: uri }
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [requestId, downloadUrl, expiresAt]
+                properties:
+                  requestId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+                  downloadUrl: { type: string, format: uri }
+                  expiresAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        "202":
+          description: Async result — poll for status.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [requestId, estimatedReady]
+                properties:
+                  requestId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+                  estimatedReady: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        "413": { $ref: "shared-schemas.yaml#/components/responses/Problem400" }
+        "503": { $ref: "shared-schemas.yaml#/components/responses/Problem503" }
+
+  /api/v1/customer/statements/{requestId}:
+    get:
+      tags: [Statements]
+      summary: Poll statement-export status
+      operationId: getStatement
+      security:
+        - OAuth2Customer: [transactions:read]
+      parameters:
+        - name: requestId
+          in: path
+          required: true
+          schema: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+      responses:
+        "200":
+          description: Status.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status:
+                    type: string
+                    enum: [PENDING, IN_PROGRESS, READY, FAILED, CANCELLED, EXPIRED]
+                  progress:
+                    type: integer
+                    minimum: 0
+                    maximum: 100
+                  downloadUrl:
+                    type: string
+                    format: uri
+                  expiresAt:
+                    $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant"
+    delete:
+      tags: [Statements]
+      summary: Cancel a pending statement export
+      operationId: cancelStatement
+      security:
+        - OAuth2Customer: [transactions:read]
+      parameters:
+        - name: requestId
+          in: path
+          required: true
+          schema: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+      responses:
+        "204":
+          description: Cancelled.
+        "409": { $ref: "shared-schemas.yaml#/components/responses/Problem409" }
+
+components:
+  securitySchemes:
+    OAuth2Customer:
+      $ref: "shared-schemas.yaml#/components/securitySchemes/OAuth2Customer"
+
+  parameters:
+    AccountId:
+      name: accountId
+      in: path
+      required: true
+      schema:
+        type: string
+        description: Stable account identifier. Distinct from IBAN; the IBAN is PII-adjacent and may rotate (e.g., after reconciliation adjustments).
+
+  schemas:
+    AccountSummary:
+      type: object
+      required:
+        - accountId
+        - iban
+        - type
+        - currency
+        - bookedBalance
+        - reservedAmount
+        - availableBalance
+        - status
+      properties:
+        accountId: { type: string }
+        iban: { $ref: "shared-schemas.yaml#/components/schemas/Iban" }
+        type: { $ref: "shared-schemas.yaml#/components/schemas/AccountType" }
+        currency: { $ref: "shared-schemas.yaml#/components/schemas/Currency" }
+        bookedBalance: { $ref: "shared-schemas.yaml#/components/schemas/MonetaryAmount" }
+        reservedAmount: { $ref: "shared-schemas.yaml#/components/schemas/MonetaryAmount" }
+        availableBalance: { $ref: "shared-schemas.yaml#/components/schemas/MonetaryAmount" }
+        status: { $ref: "shared-schemas.yaml#/components/schemas/AccountStatus" }
+        nickname: { type: string }
+        primary: { type: boolean }
+        freezeReason:
+          description: Present only when `status=FROZEN`.
+          $ref: "shared-schemas.yaml#/components/schemas/FreezeReason"
+        freezeReference: { type: string }
+
+    AccountDetail:
+      allOf:
+        - $ref: "#/components/schemas/AccountSummary"
+        - type: object
+          properties:
+            openedAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+            closedAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+            holderMasked:
+              type: string
+              description: Masked holder name ("Ola N*****"). Full name via admin UC-G36 only.
+            reservations:
+              type: array
+              items:
+                type: object
+                required: [paymentId, amount, currency, createdAt]
+                properties:
+                  paymentId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+                  amount: { $ref: "shared-schemas.yaml#/components/schemas/MonetaryAmount" }
+                  currency: { $ref: "shared-schemas.yaml#/components/schemas/Currency" }
+                  createdAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+
+    Balances:
+      type: object
+      required: [booked, reserved, available, currency]
+      properties:
+        booked: { $ref: "shared-schemas.yaml#/components/schemas/MonetaryAmount" }
+        reserved: { $ref: "shared-schemas.yaml#/components/schemas/MonetaryAmount" }
+        available: { $ref: "shared-schemas.yaml#/components/schemas/MonetaryAmount" }
+        currency: { $ref: "shared-schemas.yaml#/components/schemas/Currency" }
+
+    TransactionSummary:
+      type: object
+      required: [transactionId, postedAt, direction, amount, currency, status]
+      properties:
+        transactionId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+        postedAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        valueDate: { $ref: "shared-schemas.yaml#/components/schemas/LocalDate" }
+        direction:
+          type: string
+          enum: [DEBIT, CREDIT]
+        amount: { $ref: "shared-schemas.yaml#/components/schemas/MonetaryAmount" }
+        currency: { $ref: "shared-schemas.yaml#/components/schemas/Currency" }
+        counterpartyName: { type: string }
+        counterpartyIbanMasked:
+          type: string
+          example: "NO93 •••• •••• 7947"
+        reference: { type: string }
+        status: { $ref: "shared-schemas.yaml#/components/schemas/PaymentStatus" }
+
+    TransactionDetail:
+      allOf:
+        - $ref: "#/components/schemas/TransactionSummary"
+        - type: object
+          properties:
+            debtorName: { $ref: "shared-schemas.yaml#/components/schemas/Name" }
+            debtorIban: { $ref: "shared-schemas.yaml#/components/schemas/Iban" }
+            creditorName: { $ref: "shared-schemas.yaml#/components/schemas/Name" }
+            creditorIban: { $ref: "shared-schemas.yaml#/components/schemas/Iban" }
+            executionMode: { $ref: "shared-schemas.yaml#/components/schemas/ExecutionMode" }
+            vopResult: { $ref: "shared-schemas.yaml#/components/schemas/VoPResult" }
+            vopActualName:
+              type: string
+              description: |
+                Present only when `vopResult` was MATCH or CLOSE_MATCH at
+                initiation and disclosure rules allowed. Never present for
+                NO_MATCH or NOT_FOUND (GUI-SEC-09 structural enforcement).
+            a2PaymentId: { type: string }
+            clearingCorrelationId: { type: string }
+            settlementInstant: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+            rejectionReason: { $ref: "shared-schemas.yaml#/components/schemas/CustomerVisibleRejectionReason" }
+            relatedR2pRequestId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+
+    StatementRequest:
+      type: object
+      required: [startDate, endDate, format]
+      additionalProperties: false
+      properties:
+        startDate: { $ref: "shared-schemas.yaml#/components/schemas/LocalDate" }
+        endDate: { $ref: "shared-schemas.yaml#/components/schemas/LocalDate" }
+        format:
+          type: string
+          enum: [PDF, JSON, CAMT053]
+        scope:
+          type: string
+          enum: [ALL, BOOKED, BOOKED_PLUS_RESERVATIONS]
+          default: ALL

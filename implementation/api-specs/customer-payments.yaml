@@ -1,0 +1,493 @@
+openapi: 3.1.0
+info:
+  title: JRPay — Customer Payments
+  version: 1.0.0
+  description: |
+    Customer-facing payment endpoints: VoP pre-flight, payment initiation
+    (instant + batch), scheduled payments, status streaming via SSE, and
+    pre-SCA cancellation. Realises UC-G05, UC-G06, UC-G07, UC-G15.
+
+    Hosted by A4. Each mutating endpoint requires `Idempotency-Key`. SCA /
+    step-up enforcement uses `dl_hash` via the `admin-action`-style pattern in
+    `gui/architecture/DYNAMIC_LINKING.md` class `payment`.
+
+servers:
+  - url: "https://api.{env}.jrpay.example"
+    variables: { env: { default: dev } }
+  - url: "http://localhost:8094"
+
+tags:
+  - name: VoP
+    description: Verification-of-Payee proxy to A6 (UC-G05 §6 step 3)
+  - name: Payments
+    description: Payment initiation, detail, cancellation
+  - name: Schedules
+    description: Future-dated payments (UC-G07)
+  - name: Stream
+    description: Real-time payment-status SSE
+
+paths:
+  /api/v1/customer/payments/vop:
+    post:
+      tags: [VoP]
+      summary: Verify payee (UC-G05 §6 step 3)
+      description: |
+        Proxy to A6 with the customer's auth context; adds per-customer
+        rate-limiting (30/min) and per-IP anti-enumeration (2 / 5 s). The
+        response's `actualName` is structurally absent when the result is
+        `NO_MATCH`, `NOT_FOUND`, or disallowed by disclosure rules — GUI
+        cannot render what isn't there (GUI-SEC-09).
+      operationId: verifyPayee
+      security:
+        - OAuth2Customer: [payments:initiate]
+      parameters:
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [beneficiaryIban, statedName]
+              additionalProperties: false
+              properties:
+                beneficiaryIban: { $ref: "shared-schemas.yaml#/components/schemas/Iban" }
+                statedName: { $ref: "shared-schemas.yaml#/components/schemas/Name" }
+                requestId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+      responses:
+        "200":
+          description: VoP outcome.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [result]
+                properties:
+                  result: { $ref: "shared-schemas.yaml#/components/schemas/VoPResult" }
+                  actualName:
+                    type: string
+                    description: |
+                      Present only when `result == CLOSE_MATCH` and disclosure
+                      rules allow. **Structurally absent otherwise.**
+              examples:
+                match:
+                  value: { result: MATCH }
+                closeMatch:
+                  value: { result: CLOSE_MATCH, actualName: "Ola Nordmann" }
+                noMatch:
+                  value: { result: NO_MATCH }
+                notFound:
+                  value: { result: NOT_FOUND }
+        "429": { $ref: "shared-schemas.yaml#/components/responses/Problem429" }
+
+  /api/v1/customer/payments:
+    post:
+      tags: [Payments]
+      summary: Initiate a payment (UC-G05 / UC-G06)
+      description: |
+        Initiates an instant or standard payment. `executionMode` selects the
+        rail. On submit, server runs duplicate detection; if probable
+        duplicate, responds 409 `urn:problem:duplicate-suspected` with the
+        suspected original payment summary — client surfaces CLI-F23 banner.
+
+        SCA flow: server triggers SCA; client performs UC-G51; client returns
+        with the step-up token; server verifies the token's `dl_hash` against
+        the payment inputs (DYNAMIC_LINKING.md `payment` class). Mismatch →
+        `403 urn:problem:dynamic-linking-mismatch`.
+      operationId: initiatePayment
+      security:
+        - OAuth2Customer: [payments:initiate]
+      parameters:
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+        - $ref: "shared-schemas.yaml#/components/parameters/StepUpToken"
+        - $ref: "shared-schemas.yaml#/components/parameters/DeviceIntegrity"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PaymentRequest" }
+      responses:
+        "200":
+          description: Payment submitted; final state returned if synchronous.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PaymentAck" }
+        "202":
+          description: |
+            Payment accepted; requires SCA before submission. Response carries
+            `scaSessionId` and `dl_hash` so the client can run UC-G51.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PaymentPendingSca" }
+        "403": { $ref: "shared-schemas.yaml#/components/responses/Problem403" }
+        "409":
+          description: |
+            Possible returns:
+            - `urn:problem:duplicate-suspected` — with suspected-original body
+            - `urn:problem:idempotency-key-conflict` — replayed with different body
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+        "422":
+          description: |
+            Business-rule rejection (insufficient funds, frozen account,
+            currency unsupported, etc).
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+
+  /api/v1/customer/payments/{paymentId}:
+    get:
+      tags: [Payments]
+      summary: Payment detail (UC-G03, UC-G05 reconciliation on SSE drop)
+      operationId: getPayment
+      security:
+        - OAuth2Customer: [payments:read]
+      parameters:
+        - $ref: "#/components/parameters/PaymentId"
+      responses:
+        "200":
+          description: Payment record.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PaymentRecord" }
+        "404": { $ref: "shared-schemas.yaml#/components/responses/Problem404" }
+    delete:
+      tags: [Payments]
+      summary: Cancel pre-SCA (UC-G05 §7 AF-12, CLI-F28)
+      description: |
+        Only effective before the SCA step completes. After SCA, cancellation
+        is not possible via this endpoint; operator-side return flow (UC-G38)
+        is required.
+      operationId: cancelPayment
+      security:
+        - OAuth2Customer: [payments:cancel]
+      parameters:
+        - $ref: "#/components/parameters/PaymentId"
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+      responses:
+        "204":
+          description: Cancelled.
+        "409": { $ref: "shared-schemas.yaml#/components/responses/Problem409" }
+
+  /api/v1/customer/payments/{paymentId}/submit:
+    post:
+      tags: [Payments]
+      summary: Submit after SCA (two-call model — UC-G05 §13 open question)
+      description: |
+        Used when the submit-after-SCA pattern is configured. Client supplies
+        the step-up token; server verifies `dl_hash` match and proceeds.
+      operationId: submitPayment
+      security:
+        - OAuth2Customer: [payments:initiate]
+      parameters:
+        - $ref: "#/components/parameters/PaymentId"
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+        - $ref: "shared-schemas.yaml#/components/parameters/StepUpToken"
+      responses:
+        "200":
+          description: Submitted.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PaymentAck" }
+        "403": { $ref: "shared-schemas.yaml#/components/responses/Problem403" }
+
+  /api/v1/customer/payments/{paymentId}/refresh-status:
+    post:
+      tags: [Payments]
+      summary: Customer-initiated status refresh for batch (UC-G06 AF-07)
+      description: |
+        Triggers A4 to synchronously request fresh status from A2 (pacs.028-
+        backed path). Rate-limited server-side to once per payment per 15 min.
+      operationId: refreshPaymentStatus
+      security:
+        - OAuth2Customer: [payments:read]
+      parameters:
+        - $ref: "#/components/parameters/PaymentId"
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+      responses:
+        "200":
+          description: Refreshed status returned.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PaymentRecord" }
+        "429": { $ref: "shared-schemas.yaml#/components/responses/Problem429" }
+
+  #############################################################################
+  # Stream
+  #############################################################################
+  /api/v1/customer/payments/stream-token:
+    post:
+      tags: [Stream]
+      summary: One-time SSE stream token (UC-G05 §13, SSE_CONVENTIONS.md)
+      operationId: paymentStreamToken
+      security:
+        - OAuth2Customer: [payments:read]
+      parameters:
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                paymentId:
+                  description: If set, token is scope-bound to this payment only.
+                  $ref: "shared-schemas.yaml#/components/schemas/Uuid"
+      responses:
+        "200":
+          description: Stream token.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [streamToken, expiresIn]
+                properties:
+                  streamToken: { type: string }
+                  expiresIn: { type: integer, example: 300 }
+
+  /api/v1/customer/payments/stream:
+    get:
+      tags: [Stream]
+      summary: Payment-status SSE
+      description: |
+        Events (per SSE_CONVENTIONS.md): `payment.status-updated`,
+        `payment.held`, `payment.settled`, `payment.rejected`,
+        `payment.returned`. Heartbeat every 15 s.
+      operationId: paymentStream
+      parameters:
+        - name: token
+          in: query
+          required: true
+          schema: { type: string }
+        - name: Last-Event-ID
+          in: header
+          required: false
+          schema: { type: string }
+      responses:
+        "200":
+          description: text/event-stream
+          content:
+            text/event-stream:
+              schema: { type: string }
+
+  #############################################################################
+  # Schedules (UC-G07)
+  #############################################################################
+  /api/v1/customer/payments/schedules:
+    post:
+      tags: [Schedules]
+      summary: Create a scheduled payment
+      operationId: createSchedule
+      security:
+        - OAuth2Customer: [payments:initiate]
+      parameters:
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+        - $ref: "shared-schemas.yaml#/components/parameters/StepUpToken"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ScheduleRequest" }
+      responses:
+        "201":
+          description: Schedule created.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Schedule" }
+        "202":
+          description: Requires SCA.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PaymentPendingSca" }
+    get:
+      tags: [Schedules]
+      summary: List customer's upcoming and past schedules
+      operationId: listSchedules
+      security:
+        - OAuth2Customer: [payments:read]
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: array
+            items:
+              type: string
+              enum: [SCHEDULED, EXECUTED, CANCELLED, EXECUTION_FAILED]
+        - $ref: "shared-schemas.yaml#/components/parameters/PageNumber"
+        - $ref: "shared-schemas.yaml#/components/parameters/PageSize"
+      responses:
+        "200":
+          description: Paginated schedules.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/Schedule" }
+                  page: { $ref: "shared-schemas.yaml#/components/schemas/PageMeta" }
+
+  /api/v1/customer/payments/schedules/{scheduleId}:
+    get:
+      tags: [Schedules]
+      summary: Get schedule detail
+      operationId: getSchedule
+      security:
+        - OAuth2Customer: [payments:read]
+      parameters:
+        - name: scheduleId
+          in: path
+          required: true
+          schema: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+      responses:
+        "200":
+          description: Schedule detail.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Schedule" }
+    delete:
+      tags: [Schedules]
+      summary: Cancel a schedule (UC-G07 AF-02; must be T-1h or earlier)
+      operationId: cancelSchedule
+      security:
+        - OAuth2Customer: [payments:cancel]
+      parameters:
+        - name: scheduleId
+          in: path
+          required: true
+          schema: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+      responses:
+        "204":
+          description: Cancelled.
+        "409":
+          description: urn:problem:too-late-to-cancel
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+
+components:
+  securitySchemes:
+    OAuth2Customer:
+      $ref: "shared-schemas.yaml#/components/securitySchemes/OAuth2Customer"
+
+  parameters:
+    PaymentId:
+      name: paymentId
+      in: path
+      required: true
+      schema: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+
+  schemas:
+    PaymentRequest:
+      type: object
+      required:
+        - debtorAccountId
+        - creditorIban
+        - creditorName
+        - amount
+        - currency
+        - executionMode
+      additionalProperties: false
+      properties:
+        debtorAccountId: { type: string }
+        creditorIban: { $ref: "shared-schemas.yaml#/components/schemas/Iban" }
+        creditorName: { $ref: "shared-schemas.yaml#/components/schemas/Name" }
+        amount: { $ref: "shared-schemas.yaml#/components/schemas/MonetaryAmount" }
+        currency: { $ref: "shared-schemas.yaml#/components/schemas/Currency" }
+        reference: { type: string, maxLength: 140 }
+        description: { type: string, maxLength: 140 }
+        executionMode: { $ref: "shared-schemas.yaml#/components/schemas/ExecutionMode" }
+        vopResult: { $ref: "shared-schemas.yaml#/components/schemas/VoPResult" }
+        vopPayerOverride:
+          type: boolean
+          description: |
+            Set to `true` when the customer explicitly overrode a NO_MATCH VoP
+            outcome (UC-G05 AF-05). Signals +0.3 fraud risk weighting per
+            existing A5 contract.
+        duplicateOverride:
+          type: boolean
+          description: Set to `true` on re-submit after a `duplicate-suspected` warning.
+
+    PaymentAck:
+      type: object
+      required: [paymentId, status]
+      properties:
+        paymentId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+        status: { $ref: "shared-schemas.yaml#/components/schemas/PaymentStatus" }
+        clearingPath:
+          type: string
+          enum: [INSTANT, NICS, BOOK_TRANSFER]
+        settlementInstant: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        receiptUrl: { type: string, format: uri }
+
+    PaymentPendingSca:
+      type: object
+      required: [paymentId, scaSessionId, dl_hash]
+      properties:
+        paymentId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+        scaSessionId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+        dl_hash:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+        challenge:
+          type: object
+          additionalProperties: true
+
+    PaymentRecord:
+      type: object
+      required: [paymentId, status, amount, currency, createdAt]
+      properties:
+        paymentId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+        status: { $ref: "shared-schemas.yaml#/components/schemas/PaymentStatus" }
+        rejectionReason:
+          description: |
+            Present when `status=REJECTED`. Customer-visible taxonomy only
+            (Phase 1 FG.4).
+          $ref: "shared-schemas.yaml#/components/schemas/CustomerVisibleRejectionReason"
+        amount: { $ref: "shared-schemas.yaml#/components/schemas/MonetaryAmount" }
+        currency: { $ref: "shared-schemas.yaml#/components/schemas/Currency" }
+        debtorAccountId: { type: string }
+        creditorIban: { $ref: "shared-schemas.yaml#/components/schemas/Iban" }
+        creditorName: { $ref: "shared-schemas.yaml#/components/schemas/Name" }
+        reference: { type: string }
+        executionMode: { $ref: "shared-schemas.yaml#/components/schemas/ExecutionMode" }
+        createdAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        settlementInstant: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        caseRef:
+          type: string
+          description: Present on HELD (fraud) or GENERIC_REGULATORY rejection.
+
+    ScheduleRequest:
+      allOf:
+        - $ref: "#/components/schemas/PaymentRequest"
+        - type: object
+          required: [executeAt]
+          properties:
+            executeAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+            notes: { type: string, maxLength: 280 }
+
+    Schedule:
+      type: object
+      required: [scheduleId, status, executeAt, amount, currency]
+      properties:
+        scheduleId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+        status:
+          type: string
+          enum: [SCHEDULED, EXECUTED, CANCELLED, EXECUTION_FAILED]
+        executeAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        createdAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        amount: { $ref: "shared-schemas.yaml#/components/schemas/MonetaryAmount" }
+        currency: { $ref: "shared-schemas.yaml#/components/schemas/Currency" }
+        creditorIban: { $ref: "shared-schemas.yaml#/components/schemas/Iban" }
+        creditorName: { $ref: "shared-schemas.yaml#/components/schemas/Name" }
+        executionMode: { $ref: "shared-schemas.yaml#/components/schemas/ExecutionMode" }
+        executedPaymentId:
+          description: Present when `status=EXECUTED`.
+          $ref: "shared-schemas.yaml#/components/schemas/Uuid"
+        failureReason:
+          description: Present when `status=EXECUTION_FAILED`.
+          $ref: "shared-schemas.yaml#/components/schemas/CustomerVisibleRejectionReason"

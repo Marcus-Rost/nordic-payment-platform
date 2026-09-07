@@ -1,0 +1,55 @@
+spring:
+  application:
+    name: jrpay-psd2-api-customer-it
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    open-in-view: false
+    show-sql: false
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+  kafka:
+    bootstrap-servers: localhost:9092
+    producer:
+      acks: all
+    consumer:
+      auto-offset-reset: latest
+    listener:
+      auto-startup: false
+
+server:
+  port: 0
+management:
+  server:
+    port: 0
+
+jrpay:
+  psd2:
+    jwt:
+      jwks-uri: http://localhost:8097/oauth2/jwks
+    identity:
+      base-url: http://localhost:8097
+      client-id: jrpay-a4-service
+      client-secret: a4-service-secret
+    vop:
+      base-url: http://localhost:8096
+      max-per-window: 30
+      window-seconds: 60
+    payments:
+      duplicate-window-seconds: 120
+      refresh-min-interval-seconds: 900
+    stream:
+      ttl: PT5M
+      heartbeat-ms: 60000
+    kafka:
+      group-id: jrpay-psd2-api-test
+      ledger-events-topic: ledger.events
+      payment-status-topic: payment.status-updates
+      auto-startup: false
+
+logging:
+  level:
+    root: WARN
+    com.jrpay: INFO
+    org.flywaydb: INFO

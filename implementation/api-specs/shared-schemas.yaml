@@ -1,0 +1,739 @@
+openapi: 3.1.0
+info:
+  title: JRPay — Shared Schemas
+  version: 1.0.0
+  description: |
+    Shared type library used by all JRPay OpenAPI specs.
+
+    Contents:
+    - Canonical enum list (mirrors `gui/architecture/SHARED_ENUMS.md`)
+    - Problem Detail schemas (RFC 9457; catalogue in `gui/architecture/PROBLEM_TYPES.md`)
+    - Dynamic-linking input schemas (`gui/architecture/DYNAMIC_LINKING.md`)
+    - Common request/response envelopes, pagination, error variants.
+
+    Spec files $ref into this document. A CI lint (`jrpay-enums-match-shared`,
+    `jrpay-problem-types-registered`) verifies alignment with the canonical
+    architecture docs.
+
+paths: {}
+
+components:
+  #############################################################################
+  # Reusable parameters
+  #############################################################################
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: |
+        UUIDv4. Required on every mutating (`POST`/`PATCH`/`DELETE`) endpoint.
+        Clients generate a fresh key per logical operation; retries reuse the
+        same key so the backend can de-duplicate. Enforced by Spectral lint
+        `jrpay-idempotency-key-required`.
+      schema:
+        $ref: "#/components/schemas/Uuid"
+    StepUpToken:
+      name: Step-Up-Token
+      in: header
+      required: false
+      description: |
+        Short-lived JWT carrying `dl_hash` for the operation; issued by
+        `/sca/{sessionId}/verify`. Required on operations that need recent
+        SCA proof; the server responds `401 urn:problem:step-up-required`
+        when missing.
+      schema:
+        type: string
+    DeviceIntegrity:
+      name: X-Device-Integrity
+      in: header
+      required: false
+      description: |
+        Mobile apps report `clean` or `rooted` per GUI-SEC-12. Backend uses
+        this header together with SCA exemption logic to allow or deny
+        high-value operations (Phase 1 FM.6).
+      schema:
+        type: string
+        enum: [clean, rooted]
+    TraceParent:
+      name: traceparent
+      in: header
+      required: false
+      description: W3C Trace Context — propagated by every client.
+      schema:
+        type: string
+    AcceptLanguage:
+      name: Accept-Language
+      in: header
+      required: false
+      schema:
+        type: string
+        default: nb-NO
+    PageSize:
+      name: size
+      in: query
+      required: false
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 500
+        default: 25
+    PageNumber:
+      name: page
+      in: query
+      required: false
+      schema:
+        type: integer
+        minimum: 0
+        default: 0
+    SortAsc:
+      name: sort
+      in: query
+      required: false
+      description: "`field,direction` where direction is `asc` or `desc`."
+      schema:
+        type: string
+
+  #############################################################################
+  # Common envelopes
+  #############################################################################
+  schemas:
+    Uuid:
+      type: string
+      format: uuid
+      pattern: "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+      example: "550e8400-e29b-41d4-a716-446655440000"
+    Ulid:
+      type: string
+      pattern: "^[0-9A-HJKMNP-TV-Z]{26}$"
+      example: "01HZ1Z2E3K4Q5R6S7T8V9W0X1Y"
+    Iso8601Instant:
+      type: string
+      format: date-time
+      pattern: "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,3})?Z$"
+      example: "2026-04-24T10:15:30.000Z"
+    LocalDate:
+      type: string
+      format: date
+      pattern: "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
+      example: "2026-05-15"
+
+    Iban:
+      type: string
+      pattern: "^[A-Z]{2}[0-9]{2}[A-Z0-9]{11,30}$"
+      description: |
+        ISO 13616 IBAN without spaces. Mod-97 validated by the backend on
+        every input. Maximum 34 characters.
+      example: "NO9386011117947"
+    Bic:
+      type: string
+      pattern: "^[A-Z]{6}[A-Z0-9]{2}([A-Z0-9]{3})?$"
+      example: "DNBANOKKXXX"
+    Currency:
+      type: string
+      description: ISO 4217 alpha-3, uppercase.
+      enum: [NOK, EUR, SEK, DKK, USD]
+    MonetaryAmount:
+      type: string
+      pattern: "^-?[0-9]+(\\.[0-9]{1,4})?$"
+      description: |
+        Decimal as a string. No thousands separators. `.` as the decimal
+        separator. No trailing zeros beyond the currency's scale. See
+        `gui/architecture/DYNAMIC_LINKING.md` field-encoding rules.
+      example: "1234.56"
+    Locale:
+      type: string
+      enum: [nb-NO, en-US]
+
+    Money:
+      type: object
+      required: [amount, currency]
+      additionalProperties: false
+      properties:
+        amount: { $ref: "#/components/schemas/MonetaryAmount" }
+        currency: { $ref: "#/components/schemas/Currency" }
+      example:
+        amount: "1234.56"
+        currency: "NOK"
+
+    Name:
+      type: string
+      minLength: 1
+      maxLength: 140
+      description: |
+        Unicode NFC-normalised. No emoji. 140 chars matches the
+        SEPA creditor-name field limit.
+      example: "Ola Nordmann"
+
+    #########################################################################
+    # Pagination
+    #########################################################################
+    PageMeta:
+      type: object
+      required: [page, size, totalElements, totalPages]
+      additionalProperties: false
+      properties:
+        page: { type: integer, minimum: 0 }
+        size: { type: integer, minimum: 1 }
+        totalElements: { type: integer, minimum: 0 }
+        totalPages: { type: integer, minimum: 0 }
+        sort:
+          type: array
+          items: { type: string }
+
+    #########################################################################
+    # Canonical enums (mirror gui/architecture/SHARED_ENUMS.md)
+    #########################################################################
+    PaymentStatus:
+      type: string
+      enum:
+        - RECEIVED
+        - AWAITING_RESERVATION
+        - AWAITING_FRAUD
+        - AWAITING_SANCTIONS
+        - AWAITING_CLEARING
+        - HELD
+        - SETTLING
+        - SETTLED
+        - REJECTED
+        - RETURNED
+        - CANCELLED
+        - PENDING_SCA
+        - PENDING_EXECUTION
+
+    CustomerVisibleRejectionReason:
+      type: string
+      description: |
+        Collapsed rejection reason exposed to customer-facing endpoints
+        (Phase 1 FG.4 — anti-tipping-off). Internal reason codes remain
+        broader but are mapped before response generation.
+      enum:
+        - GENERIC_DECLINE
+        - INSUFFICIENT_FUNDS
+        - ACCOUNT_FROZEN
+        - GENERIC_REGULATORY
+        - NETWORK_TIMEOUT
+        - AUTHORIZATION_FAILED
+
+    InternalRejectionReason:
+      type: string
+      description: Admin-visible only. Never exposed on customer endpoints.
+      enum:
+        - INSUFFICIENT_FUNDS
+        - ACCOUNT_FROZEN
+        - ACCOUNT_CLOSED
+        - SANCTIONS_HIT
+        - FRAUD_CONFIRMED
+        - DUPLICATE_DETECTED
+        - CYCLE_REJECT
+        - RETURNED_BY_RECIPIENT
+        - SCHEME_REJECT
+        - ACCOUNT_UNAVAILABLE
+        - CUSTOMER_REQUEST
+
+    ExecutionMode:
+      type: string
+      enum: [INSTANT, STANDARD, BOOK_TRANSFER]
+
+    R2pStatus:
+      type: string
+      enum:
+        - PENDING
+        - ACCEPTED
+        - DECLINED
+        - DEFERRED
+        - DEFER_FAILED
+        - AMENDMENT_REQUESTED
+        - REPLACED
+        - CANCELLED_BY_MERCHANT
+        - EXPIRED
+
+    R2pDeclineReason:
+      type: string
+      enum: [ALREADY_PAID, WRONG_AMOUNT, INVOICE_INCORRECT, OTHER]
+
+    VoPResult:
+      type: string
+      enum: [MATCH, CLOSE_MATCH, NO_MATCH, NOT_FOUND, TIMEOUT, ERROR]
+
+    FraudDecision:
+      type: string
+      enum: [OPEN, ASSIGNED, INVESTIGATING, CONFIRMED_FRAUD, DISMISSED]
+
+    SanctionsHitDecision:
+      type: string
+      enum: [OPEN, CONFIRMED_SANCTION, FALSE_POSITIVE, RELEASE_FOR_FRAUD_REVIEW]
+
+    SanctionsResult:
+      type: string
+      enum: [PASS, HIT, UNCERTAIN]
+
+    ConsentStatus:
+      type: string
+      enum: [PENDING_SCA, ACTIVE, EXPIRED, REVOKED]
+
+    PsdConsentRole:
+      type: string
+      enum: [AISP, PISP, CBPII]
+
+    ConsentRevokeReason:
+      type: string
+      enum: [NO_LONGER_NEEDED, SECURITY_CONCERN, WRONG_PROVIDER, OTHER]
+
+    MandateStatus:
+      type: string
+      enum: [PENDING_SCA, ACTIVE, PAUSED, REVOKED, EXPIRED]
+
+    MandateFrequency:
+      type: string
+      enum: [MONTHLY, QUARTERLY, ON_INVOICE]
+
+    AccountStatus:
+      type: string
+      enum: [ACTIVE, FROZEN, CLOSED]
+
+    AccountType:
+      type: string
+      enum: [CHECKING, SAVINGS, CREDIT]
+
+    FreezeReason:
+      type: string
+      enum: [FRAUD_INVESTIGATION, SANCTIONS_HOLD, REGULATORY_HOLD, OTHER]
+
+    UnfreezeReason:
+      type: string
+      enum:
+        - INVESTIGATION_CONCLUDED
+        - FALSE_POSITIVE_CONFIRMED
+        - CUSTOMER_DISPUTE_RESOLVED
+        - OTHER
+
+    OperatorRole:
+      type: string
+      enum: [FRAUD_ANALYST, COMPLIANCE_OFFICER, OPERATIONS, SUPERVISOR, ADMIN]
+
+    OperatorStatus:
+      type: string
+      enum:
+        - PENDING_FIRST_LOGIN
+        - ACTIVE
+        - SUSPENDED
+        - LOCKED
+        - DELETED
+
+    AdminAction:
+      type: string
+      enum:
+        - DECIDE_FRAUD
+        - DECIDE_SANCTIONS
+        - FREEZE_ACCOUNT
+        - UNFREEZE_ACCOUNT
+        - CLOSE_ACCOUNT
+        - CREATE_ACCOUNT
+        - REVEAL_PII
+        - ISSUE_PACS028
+        - RETURN_PAYMENT
+        - RESOLVE_PAYMENT
+        - RUN_RECONCILIATION
+        - RESOLVE_DISCREPANCY
+        - VERIFY_AUDIT_CHAIN
+        - PROCESS_GDPR
+        - REJECT_GDPR
+        - PUBLISH_STATUS_BANNER
+        - CREATE_OPERATOR
+        - UPDATE_OPERATOR_ROLE
+        - SUSPEND_OPERATOR
+        - REACTIVATE_OPERATOR
+        - DELETE_OPERATOR
+        - UNLOCK_OPERATOR
+
+    GdprRequestType:
+      type: string
+      enum: [ACCESS, ERASURE, RECTIFICATION, OBJECTION]
+
+    GdprRequestStatus:
+      type: string
+      enum:
+        - PENDING
+        - IN_PROGRESS
+        - IN_PROGRESS_RETRYING
+        - READY
+        - COMPLETED
+        - REJECTED
+        - FAILED
+        - CANCELLED
+        - EXPIRED
+
+    NotificationCategory:
+      type: string
+      enum:
+        - PAYMENT_STATUS
+        - FRAUD_HOLD
+        - SANCTIONS_BLOCK
+        - R2P_INCOMING
+        - CONSENT_EVENTS
+        - MANDATE_PRE_DEBIT
+        - SECURITY_EVENTS
+        - GDPR_STATUS
+        - ACCOUNT_FREEZE
+        - SYSTEM_MAINTENANCE
+        - PROFILE_CHANGE
+        - MARKETING
+
+    NotificationChannel:
+      type: string
+      enum: [INBOX, EMAIL, SMS, PUSH]
+
+    ConsentLogCategory:
+      type: string
+      description: |
+        Customer-visible consent-log classification. See
+        `SHARED_ENUMS.md` "ConsentLogCategory".
+      enum:
+        - PSD2_AIS
+        - PSD2_PIS
+        - PSD2_CBPII
+        - VRP
+        - MARKETING
+        - NOTIFICATION_PREF
+        - COOKIE
+        - PRIVACY_NOTICE
+        - GDPR_DISCLOSURE
+
+    ConsentLogType:
+      type: string
+      description: |
+        Event type recorded against a `ConsentLogCategory`. See
+        `SHARED_ENUMS.md` "ConsentLogType".
+      enum:
+        - CONSENT_GRANTED
+        - CONSENT_REVOKED
+        - CONSENT_EXPIRED
+        - CONSENT_RENEWED
+        - MARKETING_OPTED_IN
+        - MARKETING_OPTED_OUT
+        - NOTIFICATION_PREF_CHANGED
+        - COOKIE_CONSENT_UPDATED
+        - PRIVACY_NOTICE_ACCEPTED
+        - GDPR_DISCLOSURE_ACKNOWLEDGED
+
+    AuditSeverity:
+      type: string
+      enum: [INFO, WARN, ERROR, CRITICAL]
+
+    BannerSeverity:
+      type: string
+      enum: [INFO, WARNING, CRITICAL]
+
+    BannerAudience:
+      type: string
+      enum: [CUSTOMER, ADMIN, BOTH]
+
+    ScaFactorType:
+      type: string
+      enum: [TOTP, BANKID_SIMULATED, BANKID_REAL, BIOMETRIC]
+
+    ScaAcrLevel:
+      type: string
+      enum: [loa1, loa3, loa3-admin]
+
+    #########################################################################
+    # Dynamic-linking input schemas (DYNAMIC_LINKING.md classes)
+    #########################################################################
+    DynamicLinkingInput:
+      oneOf:
+        - $ref: "#/components/schemas/DlPaymentInput"
+        - $ref: "#/components/schemas/DlPaymentScheduleInput"
+        - $ref: "#/components/schemas/DlMandateInput"
+        - $ref: "#/components/schemas/DlVrpConsentInput"
+        - $ref: "#/components/schemas/DlPsd2ConsentInput"
+        - $ref: "#/components/schemas/DlBeneficiaryInput"
+        - $ref: "#/components/schemas/DlAdminActionInput"
+        - $ref: "#/components/schemas/DlGdprErasureInput"
+        - $ref: "#/components/schemas/DlProfileChangeInput"
+      discriminator:
+        propertyName: class
+        mapping:
+          payment: "#/components/schemas/DlPaymentInput"
+          payment-schedule: "#/components/schemas/DlPaymentScheduleInput"
+          mandate: "#/components/schemas/DlMandateInput"
+          vrp-consent: "#/components/schemas/DlVrpConsentInput"
+          psd2-consent: "#/components/schemas/DlPsd2ConsentInput"
+          beneficiary: "#/components/schemas/DlBeneficiaryInput"
+          admin-action: "#/components/schemas/DlAdminActionInput"
+          gdpr-erasure: "#/components/schemas/DlGdprErasureInput"
+          profile-change: "#/components/schemas/DlProfileChangeInput"
+
+    DlPaymentInput:
+      type: object
+      required: [class, paymentId, amount, currency, creditorIban, creditorName, executionMode]
+      additionalProperties: false
+      properties:
+        class: { type: string, enum: [payment] }
+        paymentId: { $ref: "#/components/schemas/Uuid" }
+        amount: { $ref: "#/components/schemas/MonetaryAmount" }
+        currency: { $ref: "#/components/schemas/Currency" }
+        creditorIban: { $ref: "#/components/schemas/Iban" }
+        creditorName: { $ref: "#/components/schemas/Name" }
+        executionMode: { $ref: "#/components/schemas/ExecutionMode" }
+    DlPaymentScheduleInput:
+      type: object
+      required: [class, scheduleId, amount, currency, creditorIban, creditorName, executeAt, executionMode]
+      additionalProperties: false
+      properties:
+        class: { type: string, enum: [payment-schedule] }
+        scheduleId: { $ref: "#/components/schemas/Uuid" }
+        amount: { $ref: "#/components/schemas/MonetaryAmount" }
+        currency: { $ref: "#/components/schemas/Currency" }
+        creditorIban: { $ref: "#/components/schemas/Iban" }
+        creditorName: { $ref: "#/components/schemas/Name" }
+        executeAt: { $ref: "#/components/schemas/Iso8601Instant" }
+        executionMode: { $ref: "#/components/schemas/ExecutionMode" }
+    DlMandateInput:
+      type: object
+      required: [class, mandateId, merchantId, maxAmount, currency, debtorAccountId]
+      additionalProperties: false
+      properties:
+        class: { type: string, enum: [mandate] }
+        mandateId: { $ref: "#/components/schemas/Uuid" }
+        merchantId: { type: string }
+        maxAmount: { $ref: "#/components/schemas/MonetaryAmount" }
+        currency: { $ref: "#/components/schemas/Currency" }
+        debtorAccountId: { type: string }
+    DlVrpConsentInput:
+      type: object
+      required: [class, consentId, payee, payeeIban, perPaymentMax, cumulativeCap, currency, periodType, frequencyMax, validUntil]
+      additionalProperties: false
+      properties:
+        class: { type: string, enum: [vrp-consent] }
+        consentId: { $ref: "#/components/schemas/Uuid" }
+        payee: { $ref: "#/components/schemas/Name" }
+        payeeIban: { $ref: "#/components/schemas/Iban" }
+        perPaymentMax: { $ref: "#/components/schemas/MonetaryAmount" }
+        cumulativeCap: { $ref: "#/components/schemas/MonetaryAmount" }
+        currency: { $ref: "#/components/schemas/Currency" }
+        periodType: { type: string, enum: [DAILY, WEEKLY, MONTHLY, QUARTERLY] }
+        frequencyMax: { type: integer, minimum: 1 }
+        validUntil: { $ref: "#/components/schemas/Iso8601Instant" }
+    DlPsd2ConsentInput:
+      type: object
+      required: [class, consentId, tppId, role, scopes, accountIds, validUntil]
+      additionalProperties: false
+      properties:
+        class: { type: string, enum: [psd2-consent] }
+        consentId: { $ref: "#/components/schemas/Uuid" }
+        tppId: { type: string }
+        role: { $ref: "#/components/schemas/PsdConsentRole" }
+        scopes:
+          type: array
+          items: { type: string }
+          description: Sorted lexicographically (DYNAMIC_LINKING.md field rule 7).
+        accountIds:
+          type: array
+          items: { type: string }
+          description: Sorted lexicographically.
+        validUntil: { $ref: "#/components/schemas/Iso8601Instant" }
+    DlBeneficiaryInput:
+      type: object
+      required: [class, beneficiaryId, name, iban]
+      additionalProperties: false
+      properties:
+        class: { type: string, enum: [beneficiary] }
+        beneficiaryId: { $ref: "#/components/schemas/Uuid" }
+        name: { $ref: "#/components/schemas/Name" }
+        iban: { $ref: "#/components/schemas/Iban" }
+    DlAdminActionInput:
+      type: object
+      required: [class, action, resourceType, resourceId, notesHash]
+      additionalProperties: false
+      properties:
+        class: { type: string, enum: [admin-action] }
+        action: { $ref: "#/components/schemas/AdminAction" }
+        resourceType:
+          type: string
+          enum: [case, hit, account, payment, audit, gdpr-request, user, banner]
+        resourceId: { type: string }
+        decision:
+          type: string
+          description: Optional; present for decide-style actions.
+        notesHash:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+          description: Lowercase hex of SHA-256 over the operator's notes in NFC.
+    DlGdprErasureInput:
+      type: object
+      required: [class, customerId, accountIds]
+      additionalProperties: false
+      properties:
+        class: { type: string, enum: [gdpr-erasure] }
+        customerId: { type: string }
+        accountIds:
+          type: array
+          items: { type: string }
+    DlProfileChangeInput:
+      type: object
+      required: [class, field, newValueHash]
+      additionalProperties: false
+      properties:
+        class: { type: string, enum: [profile-change] }
+        field: { type: string, enum: [address, email, phone] }
+        newValueHash:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+
+    #########################################################################
+    # RFC 9457 Problem envelope
+    #########################################################################
+    Problem:
+      type: object
+      description: |
+        RFC 9457 Problem Detail. `type` URIs are listed in
+        `gui/architecture/PROBLEM_TYPES.md`; a CI lint rejects unknown values.
+      required: [type, title, status]
+      properties:
+        type:
+          type: string
+          format: uri
+          example: "urn:problem:insufficient-funds"
+        title:
+          type: string
+          example: Account balance too low
+        status:
+          type: integer
+          minimum: 400
+          maximum: 599
+          example: 402
+        detail:
+          type: string
+          example: Requested 1234.56 NOK; available 500.00 NOK.
+        instance:
+          type: string
+          format: uri-reference
+          description: |
+            RFC 9457 allows either an absolute URI or a URI reference here;
+            the GUI tier emits request-path URI references.
+          example: "/api/v1/customer/payments/550e8400-e29b-41d4-a716-446655440000"
+        correlationId: { $ref: "#/components/schemas/Uuid" }
+        retryAfterSec:
+          type: integer
+          minimum: 0
+        supportReference:
+          type: string
+        details:
+          type: object
+          additionalProperties: true
+
+  #############################################################################
+  # Reusable responses (RFC 9457 Problem bodies)
+  #############################################################################
+  responses:
+    Problem400:
+      description: Bad request — validation or canonical-input error.
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+    Problem401:
+      description: Unauthenticated, expired, or SCA required.
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+    Problem403:
+      description: Forbidden — scope missing or dynamic-linking mismatch.
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+    Problem404:
+      description: Not found.
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+    Problem409:
+      description: Conflict — idempotency / state / concurrency.
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+    Problem410:
+      description: Gone — resource expired or consumed.
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+    Problem422:
+      description: Unprocessable entity — business-rule failure.
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+    Problem423:
+      description: Locked — rate-limit lockout or account lock.
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+    Problem429:
+      description: Rate limit exceeded.
+      headers:
+        Retry-After:
+          description: Seconds until client may retry.
+          schema: { type: integer, minimum: 0 }
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+    Problem503:
+      description: Temporarily unavailable.
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+
+  #############################################################################
+  # Security schemes (shared)
+  #############################################################################
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        Access token issued by the identity service. 15-minute TTL, RS256,
+        `dl_hash` claim when step-up SCA is in effect.
+    OAuth2Customer:
+      type: oauth2
+      flows:
+        authorizationCode:
+          authorizationUrl: /oauth2/authorize
+          tokenUrl: /oauth2/token
+          refreshUrl: /oauth2/token
+          scopes:
+            accounts:read: Read account list and balances
+            transactions:read: Read transaction history
+            payments:initiate: Initiate payments
+            payments:read: Read payment details
+            payments:cancel: Cancel own payments (pre-SCA or scheduled)
+            mandates:manage: Manage AvtaleGiro mandates
+            consents:manage: Manage PSD2 / VRP consents
+            beneficiaries:manage: Manage trusted beneficiaries
+            notifications:manage: Manage notification preferences and devices
+            profile:read: Read own profile
+            profile:write: Update own profile
+            gdpr:export: Request GDPR export
+            gdpr:erase: Request GDPR erasure
+    OAuth2Admin:
+      type: oauth2
+      flows:
+        authorizationCode:
+          authorizationUrl: /oauth2/authorize
+          tokenUrl: /oauth2/token
+          refreshUrl: /oauth2/token
+          scopes:
+            fraud:read: Read fraud queue
+            fraud:manage: Decide fraud cases
+            sanctions:read: Read sanctions hits
+            sanctions:manage: Decide sanctions hits
+            accounts:admin:read: Read any account
+            accounts:admin:write: Freeze/unfreeze/close/create accounts; reveal PII
+            audit:read: Search audit log
+            audit:verify: Trigger hash-chain verification
+            reconciliation:read: Read reconciliation state
+            reconciliation:run: Run reconciliation
+            payments:investigate: Investigate stuck payments; issue pacs.028, pacs.004
+            gdpr:execute: Process GDPR queue
+            users:read: List operator users
+            users:manage: Create/suspend/reactivate/delete operators
+            system:read: System health + SLA

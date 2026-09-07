@@ -1,0 +1,548 @@
+openapi: 3.1.0
+info:
+  title: JRPay — Admin Audit
+  version: 1.0.0
+  description: |
+    Admin-facing audit log search, hash-chain integrity view, on-demand
+    verification, and audit-bundle export. Realises UC-G40.
+
+    Hosted by the new `jrpay-audit-query` module (Phase 2H). Integrity
+    checkpoints come from the existing SEC-07 hash-chain already produced
+    by the backend; this spec exposes a read + verify + export surface.
+
+    Verification triggers step-up SCA (`action=VERIFY_AUDIT_CHAIN`);
+    exports are audited but do not require step-up per UC-G40 §6.4 — the
+    bundle content is the same data the operator already sees.
+
+    Bundle downloads are signed-URL (1-hour TTL per
+    `SIGNED_URL_CONVENTIONS.md`).
+
+    See `shared-schemas.yaml` for enums + Problem envelope + pagination.
+
+servers:
+  - url: "https://admin-api.{env}.jrpay.example"
+    variables: { env: { default: dev } }
+  - url: "http://localhost:8099"
+    description: Local dev (jrpay-audit-query module)
+
+tags:
+  - name: Audit-Events
+    description: UC-G40 §6.1 — search / detail
+  - name: Audit-Chain
+    description: UC-G40 §6.2 / §6.3 — checkpoints + verify
+  - name: Audit-Export
+    description: UC-G40 §6.4 — async CSV / signed JSON bundle
+
+paths:
+  #############################################################################
+  # Events (UC-G40 §6.1)
+  #############################################################################
+  /api/v1/admin/audit/events:
+    get:
+      tags: [Audit-Events]
+      summary: Search audit events (UC-G40 §6.1)
+      description: |
+        Default window: last 24 h. Filters compose with AND. Free-text
+        search is a tsquery over `summary` + `resourceId` + `actor`.
+        Result cap: 10 000 (UC-G40 AF-01) — beyond that the client must
+        narrow the filter or use export.
+
+        Every search is audited (`audit.searched`) so the meta-audit is
+        searchable too — including self-searches (UC-G40 AF-03).
+      operationId: searchAuditEvents
+      security:
+        - OAuth2Admin: [audit:read]
+      parameters:
+        - name: from
+          in: query
+          schema: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        - name: to
+          in: query
+          schema: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        - name: type
+          in: query
+          description: |
+            Multi-value event-type filter. Catalogue is large (60+
+            types); the UI renders a typeahead against a static list
+            served separately.
+          schema:
+            type: array
+            items: { type: string }
+          style: form
+          explode: true
+        - name: actor
+          in: query
+          description: Operator id or customer id; prefix with `operator:` or `customer:`.
+          schema: { type: string }
+        - name: resourceType
+          in: query
+          schema:
+            type: string
+            enum: [case, hit, account, payment, audit, gdpr-request, user, banner]
+        - name: resourceId
+          in: query
+          schema: { type: string }
+        - name: outcome
+          in: query
+          schema:
+            type: array
+            items:
+              type: string
+              enum: [SUCCESS, FAILURE, REJECTED]
+          style: form
+          explode: true
+        - name: severity
+          in: query
+          schema:
+            type: array
+            items: { $ref: "shared-schemas.yaml#/components/schemas/AuditSeverity" }
+          style: form
+          explode: true
+        - name: q
+          in: query
+          description: Free-text search over summary + actor + resourceId.
+          schema: { type: string }
+        - $ref: "shared-schemas.yaml#/components/parameters/PageNumber"
+        - $ref: "shared-schemas.yaml#/components/parameters/PageSize"
+        - $ref: "shared-schemas.yaml#/components/parameters/SortAsc"
+      responses:
+        "200":
+          description: Paginated events.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, page, truncated]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/AuditEventSummary" }
+                  page: { $ref: "shared-schemas.yaml#/components/schemas/PageMeta" }
+                  truncated:
+                    type: boolean
+                    description: |
+                      `true` when the server capped results at 10 000 —
+                      UI prompts the operator to narrow or export.
+
+  /api/v1/admin/audit/events/{eventId}:
+    get:
+      tags: [Audit-Events]
+      summary: Audit event detail
+      description: |
+        Full event payload. PII is masked per standard; UC-G36-style
+        reveal on specific fields is available server-side for operators
+        with `accounts:admin:read` / `accounts:admin:write` — reveal is
+        audited, producing meta-audit rows.
+      operationId: getAuditEvent
+      security:
+        - OAuth2Admin: [audit:read]
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema: { $ref: "shared-schemas.yaml#/components/schemas/Ulid" }
+      responses:
+        "200":
+          description: Event detail.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AuditEventDetail" }
+        "404": { $ref: "shared-schemas.yaml#/components/responses/Problem404" }
+
+  /api/v1/admin/audit/event-types:
+    get:
+      tags: [Audit-Events]
+      summary: Event-type catalogue (for typeahead)
+      description: |
+        Static list of event types recognised by the projection, with
+        their localised display labels and severity defaults. Cacheable
+        for 1 hour client-side.
+      operationId: listAuditEventTypes
+      security:
+        - OAuth2Admin: [audit:read]
+      responses:
+        "200":
+          description: Catalogue.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      required: [type, displayKey, defaultSeverity]
+                      properties:
+                        type: { type: string }
+                        displayKey:
+                          type: string
+                          description: i18n key.
+                        defaultSeverity:
+                          $ref: "shared-schemas.yaml#/components/schemas/AuditSeverity"
+
+  #############################################################################
+  # Chain integrity (UC-G40 §6.2 / §6.3)
+  #############################################################################
+  /api/v1/admin/audit/checkpoints:
+    get:
+      tags: [Audit-Chain]
+      summary: Hash-chain checkpoint list (UC-G40 §6.2)
+      description: |
+        Returns checkpoints covering the visible audit stream. Each
+        checkpoint is a verified contiguous range; gaps are represented
+        as separate `Gap` entries in the response's `gaps[]` array — the
+        UI renders green bars for contiguous ranges and red bars for gaps.
+      operationId: listAuditCheckpoints
+      security:
+        - OAuth2Admin: [audit:read]
+      parameters:
+        - name: from
+          in: query
+          schema: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        - name: to
+          in: query
+          schema: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+      responses:
+        "200":
+          description: Checkpoints + gaps.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CheckpointView" }
+
+  /api/v1/admin/audit/verify:
+    post:
+      tags: [Audit-Chain]
+      summary: Trigger on-demand hash-chain verification (UC-G40 §6.3)
+      description: |
+        Re-computes the chain for the selected range and returns the
+        result. Step-up SCA required (`action=VERIFY_AUDIT_CHAIN`).
+        Response includes mismatch offsets on failure; first-mismatch
+        diff is provided for quick diagnosis.
+      operationId: verifyAuditChain
+      security:
+        - OAuth2Admin: [audit:verify]
+      parameters:
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+        - $ref: "shared-schemas.yaml#/components/parameters/StepUpToken"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/VerifyChainRequest" }
+      responses:
+        "200":
+          description: Verification result.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/VerifyChainAck" }
+        "403":
+          description: urn:problem:dynamic-linking-mismatch
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+
+  #############################################################################
+  # Export (UC-G40 §6.4)
+  #############################################################################
+  /api/v1/admin/audit/export:
+    post:
+      tags: [Audit-Export]
+      summary: Request an audit-bundle export (UC-G40 §6.4)
+      description: |
+        Produces either a CSV (simple) or a signed JSON bundle (KMS-
+        signed when available; falls back to unsigned with explicit
+        `unsignedReason` when KMS is unavailable — UC-G40 §6.4 step 3,
+        ARCHITECTURE_DECISIONS G.7b).
+
+        Async flow: returns `202` with a `requestId`; poll
+        `GET /export/{requestId}` for status; when READY, `downloadUrl`
+        carries a 1-hour signed URL (single-use,
+        `SIGNED_URL_CONVENTIONS.md`).
+      operationId: requestAuditExport
+      security:
+        - OAuth2Admin: [audit:read]
+      parameters:
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/AuditExportRequest" }
+      responses:
+        "202":
+          description: Export queued.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AuditExport" }
+        "422":
+          description: |
+            Result set above the hard cap (narrower filter required) or
+            invalid range.
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+
+  /api/v1/admin/audit/export/{requestId}:
+    get:
+      tags: [Audit-Export]
+      summary: Poll export status
+      operationId: getAuditExport
+      security:
+        - OAuth2Admin: [audit:read]
+      parameters:
+        - name: requestId
+          in: path
+          required: true
+          schema: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+      responses:
+        "200":
+          description: Status.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AuditExport" }
+        "404": { $ref: "shared-schemas.yaml#/components/responses/Problem404" }
+
+  /api/v1/admin/audit/export/{requestId}/download:
+    get:
+      tags: [Audit-Export]
+      summary: Download the export (302 to signed URL)
+      operationId: downloadAuditExport
+      security:
+        - OAuth2Admin: [audit:read]
+      parameters:
+        - name: requestId
+          in: path
+          required: true
+          schema: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+      responses:
+        "302":
+          description: Redirect to signed URL.
+          headers:
+            Location:
+              schema: { type: string, format: uri }
+        "404": { $ref: "shared-schemas.yaml#/components/responses/Problem404" }
+        "410":
+          description: urn:problem:signed-url-expired
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+        "425":
+          description: urn:problem:export-not-ready
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+
+components:
+  securitySchemes:
+    OAuth2Admin:
+      $ref: "shared-schemas.yaml#/components/securitySchemes/OAuth2Admin"
+
+  schemas:
+    AuditEventSummary:
+      type: object
+      required: [eventId, at, type, actor, outcome]
+      properties:
+        eventId: { $ref: "shared-schemas.yaml#/components/schemas/Ulid" }
+        at: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        type: { type: string }
+        actor:
+          type: string
+          description: |
+            `operator:<id>` or `customer:<id>` or `system:<subsystem>`.
+        outcome:
+          type: string
+          enum: [SUCCESS, FAILURE, REJECTED]
+        severity: { $ref: "shared-schemas.yaml#/components/schemas/AuditSeverity" }
+        summary:
+          type: string
+          maxLength: 280
+        resourceType:
+          type: string
+          enum: [case, hit, account, payment, audit, gdpr-request, user, banner]
+        resourceId: { type: string }
+        correlationId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+        chainOffset:
+          type: integer
+          minimum: 0
+          description: The event's position in the hash chain.
+
+    AuditEventDetail:
+      allOf:
+        - $ref: "#/components/schemas/AuditEventSummary"
+        - type: object
+          properties:
+            payload:
+              type: object
+              description: Full event payload with masked PII fields.
+              additionalProperties: true
+            chainHash:
+              type: string
+              pattern: "^[0-9a-f]{64}$"
+              description: SHA-256 hash of this event's canonicalised row + prior hash.
+            priorHash:
+              type: string
+              pattern: "^[0-9a-f]{64}$"
+            signedBy:
+              description: |
+                Operator key fingerprint that signed this event (when the
+                actor is an operator performing a `*:manage` action).
+              type: string
+            kafkaTopic: { type: string }
+            kafkaOffset: { type: integer, minimum: 0 }
+            kafkaPartition: { type: integer, minimum: 0 }
+
+    CheckpointView:
+      type: object
+      required: [ranges, gaps]
+      properties:
+        ranges:
+          type: array
+          description: Contiguous, verified ranges.
+          items: { $ref: "#/components/schemas/Checkpoint" }
+        gaps:
+          type: array
+          description: Gaps between contiguous ranges (missing or unverified).
+          items: { $ref: "#/components/schemas/CheckpointGap" }
+
+    Checkpoint:
+      type: object
+      required: [fromOffset, toOffset, hash, verifiedAt, verifiedBy]
+      properties:
+        fromOffset: { type: integer, minimum: 0 }
+        toOffset: { type: integer, minimum: 0 }
+        hash:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+          description: Hash of `toOffset`'s event (roll-up of prior hashes).
+        verifiedAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        verifiedBy:
+          description: |
+            `system:chain-verifier` or operator id on manual verify.
+          type: string
+        eventCount: { type: integer, minimum: 0 }
+
+    CheckpointGap:
+      type: object
+      required: [fromOffset, toOffset, severity]
+      properties:
+        fromOffset: { type: integer, minimum: 0 }
+        toOffset: { type: integer, minimum: 0 }
+        severity: { $ref: "shared-schemas.yaml#/components/schemas/AuditSeverity" }
+        reason:
+          type: string
+          enum: [MISSING_EVENTS, HASH_MISMATCH, AWAITING_VERIFICATION]
+        detectedAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+
+    VerifyChainRequest:
+      type: object
+      required: [fromOffset, toOffset]
+      additionalProperties: false
+      properties:
+        fromOffset: { type: integer, minimum: 0 }
+        toOffset: { type: integer, minimum: 0 }
+        reason:
+          type: string
+          maxLength: 280
+          description: |
+            Optional operator rationale — included in the audit event.
+
+    VerifyChainAck:
+      type: object
+      required: [verified, fromOffset, toOffset, durationMs]
+      properties:
+        verified: { type: boolean }
+        fromOffset: { type: integer, minimum: 0 }
+        toOffset: { type: integer, minimum: 0 }
+        eventCount: { type: integer, minimum: 0 }
+        durationMs: { type: integer, minimum: 0 }
+        mismatchOffsets:
+          type: array
+          description: Present when `verified=false`. Up to 100 offsets.
+          items: { type: integer, minimum: 0 }
+          maxItems: 100
+        firstMismatchDiff:
+          type: object
+          description: |
+            First mismatch's diff — expected vs actual hashes — so the
+            UI can render a red banner with a pinpoint location.
+          properties:
+            offset: { type: integer, minimum: 0 }
+            expectedHash: { type: string, pattern: "^[0-9a-f]{64}$" }
+            actualHash: { type: string, pattern: "^[0-9a-f]{64}$" }
+
+    AuditExportRequest:
+      type: object
+      required: [format, filter]
+      additionalProperties: false
+      properties:
+        format:
+          type: string
+          enum: [CSV, JSON_SIGNED]
+        filter:
+          type: object
+          description: |
+            Same shape as search-filter query parameters; server re-runs
+            the query against the full audit stream and streams the
+            result into the export.
+          additionalProperties: false
+          properties:
+            from: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+            to: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+            type:
+              type: array
+              items: { type: string }
+            actor: { type: string }
+            resourceType:
+              type: string
+              enum: [case, hit, account, payment, audit, gdpr-request, user, banner]
+            resourceId: { type: string }
+            outcome:
+              type: array
+              items:
+                type: string
+                enum: [SUCCESS, FAILURE, REJECTED]
+            severity:
+              type: array
+              items: { $ref: "shared-schemas.yaml#/components/schemas/AuditSeverity" }
+            q: { type: string }
+        reason:
+          type: string
+          maxLength: 280
+
+    AuditExport:
+      type: object
+      required: [requestId, status, format, requestedAt]
+      properties:
+        requestId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+        status:
+          type: string
+          enum: [PENDING, IN_PROGRESS, READY, FAILED, EXPIRED, CANCELLED]
+        format:
+          type: string
+          enum: [CSV, JSON_SIGNED]
+        requestedAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        readyAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        downloadUrl: { type: string, format: uri }
+        downloadExpiresAt:
+          $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant"
+        progress:
+          type: integer
+          minimum: 0
+          maximum: 100
+        artefactSizeBytes:
+          type: integer
+          minimum: 0
+        signed:
+          type: boolean
+          description: |
+            `true` when the signed JSON bundle was successfully signed by
+            KMS. `false` on the portfolio-default fallback; see
+            `unsignedReason`.
+        unsignedReason:
+          type: string
+          description: |
+            Present only when `format=JSON_SIGNED && signed=false`. Explains
+            why signing was skipped (e.g. `KMS_UNAVAILABLE`).
+        failureReason: { type: string }

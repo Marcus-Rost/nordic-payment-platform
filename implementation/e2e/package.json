@@ -1,0 +1,20 @@
+{
+  "name": "@jrpay/e2e",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "JRPay cross-client end-to-end test suite. Drives admin-web (5174) + client-web (5173) + backend (A1-A6, identity, audit, notifications) in a single Playwright run. See README.md for the runbook.",
+  "scripts": {
+    "test": "playwright test",
+    "test:headed": "playwright test --headed",
+    "test:ui": "playwright test --ui",
+    "test:install": "playwright install chromium",
+    "report": "playwright show-report"
+  },
+  "devDependencies": {
+    "@axe-core/playwright": "^4.10.0",
+    "@playwright/test": "^1.49.0",
+    "@types/node": "^22.10.0",
+    "typescript": "^5.6.3"
+  }
+}

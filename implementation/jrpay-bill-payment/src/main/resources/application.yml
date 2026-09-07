@@ -1,0 +1,36 @@
+spring:
+  application:
+    name: jrpay-bill-payment
+  datasource:
+    url: jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5443}/billpay
+    username: ${DB_USER:billpay}
+    password: ${DB_PASSWORD:billpay}
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    open-in-view: false
+  flyway:
+    enabled: true
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP:localhost:9092}
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+      acks: all
+      properties:
+        enable.idempotence: true
+
+server:
+  port: 8093
+management:
+  server:
+    port: 9093
+
+jrpay:
+  billpay:
+    jwt:
+      jwks-uri: ${JRPAY_BILLPAY_JWKS_URI:http://localhost:8097/oauth2/jwks}
+    identity:
+      base-url: ${JRPAY_BILLPAY_IDENTITY_BASE_URL:http://localhost:8097}
+      client-id: ${JRPAY_BILLPAY_IDENTITY_CLIENT_ID:jrpay-a3-service}
+      client-secret: ${JRPAY_BILLPAY_IDENTITY_CLIENT_SECRET:a3-service-secret}

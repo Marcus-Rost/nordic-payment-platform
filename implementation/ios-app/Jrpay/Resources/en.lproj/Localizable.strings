@@ -1,0 +1,69 @@
+/* JRPay iOS — English strings */
+
+"app_name" = "JRPay";
+
+"login_title" = "Sign in";
+"login_subtitle" = "Sign in with BankID to open online banking.";
+"login_continue_with_bankid" = "Continue with BankID";
+"login_sca_notice" = "Money transfers require BankID confirmation.";
+
+"nav_dashboard" = "Dashboard";
+"nav_payments" = "Payments";
+"nav_r2p" = "Requests";
+"nav_more" = "More";
+
+"dashboard_title" = "Welcome back";
+"dashboard_total_balance" = "Total balance";
+"dashboard_recent_activity" = "Recent activity";
+
+"accounts_title" = "Accounts";
+"accounts_available" = "Available";
+"accounts_balance" = "Balance";
+
+"payments_new_instant" = "New instant payment";
+"payments_creditor_iban" = "Creditor IBAN";
+"payments_creditor_name" = "Creditor name";
+"payments_amount" = "Amount";
+"payments_reference" = "Reference / KID";
+"payments_from_account" = "From account";
+"payments_vop_match" = "Payee verified";
+"payments_vop_close" = "Payee name is similar — verify before continuing.";
+"payments_vop_mismatch" = "Payee name does not match.";
+"payments_vop_unavailable" = "Could not verify payee (offline).";
+"payments_submit_instant" = "Send instant payment";
+
+"mandates_title" = "AvtaleGiro mandates";
+"mandates_terminate" = "Terminate";
+
+"r2p_title" = "Payment requests";
+"r2p_accept" = "Accept";
+"r2p_decline" = "Decline";
+"r2p_no_requests" = "No active requests";
+
+"beneficiaries_title" = "Beneficiaries";
+"beneficiaries_trust" = "Mark as trusted";
+"beneficiaries_untrust" = "Remove trust";
+
+"consents_title" = "Active consents";
+"consents_revoke" = "Revoke";
+
+"notifications_title" = "Notifications";
+
+"profile_title" = "Profile";
+
+"privacy_title" = "Privacy & GDPR";
+"privacy_request_export" = "Request export";
+"privacy_request_erasure" = "Request erasure";
+
+"sca_title" = "Confirm action";
+"sca_description" = "Confirm with BankID to complete.";
+
+"biometric_unlock_reason" = "Unlock JRPay";
+
+"common_loading" = "Loading…";
+"common_cancel" = "Cancel";
+"common_confirm" = "Confirm";
+"common_save" = "Save";
+"common_logout" = "Logout";
+"common_delete" = "Delete";
+"common_no_results" = "No results";

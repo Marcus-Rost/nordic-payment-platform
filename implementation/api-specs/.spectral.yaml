@@ -1,0 +1,201 @@
+extends:
+  - spectral:oas
+
+functionsDir: "./.spectral/functions"
+functions:
+  - jrpayIdempotencyKeyRequired
+  - jrpayProblemTypesRegistered
+  - jrpaySecurityRequired
+  - jrpayRfc9457ErrorFormat
+  - jrpayEnumsInShared
+
+aliases:
+  # Every Operation Object, regardless of verb. Used by security + error
+  # format rules.
+  AllOperations:
+    - "#Operation"
+  Operation:
+    - "$.paths[*][get,put,post,delete,patch,options,head,trace]"
+  # Every Operation Object for mutating verbs.
+  MutatingOperations:
+    - "$.paths[*][post,patch,delete]"
+
+overrides:
+  # shared-schemas.yaml is a component library with no paths by design.
+  # Disable the server-required rule; the path-based JRPay rules are
+  # naturally no-ops when there are no operations.
+  - files:
+      - "shared-schemas.yaml"
+      - "**/shared-schemas.yaml"
+    rules:
+      oas3-api-servers: off
+
+rules:
+  ############################################################
+  # JRPay GUI-tier house rules (`GP` = general convention)
+  ############################################################
+
+  # GP-IDEMPOTENCY — every POST / PATCH / DELETE must declare an
+  # Idempotency-Key header. OAuth2 + public + discovery paths are
+  # exempt (see function for full exemption list).
+  jrpay-idempotency-key-required:
+    description: Mutating operations must declare an Idempotency-Key header parameter.
+    message: "{{error}}"
+    severity: error
+    given:
+      - "#MutatingOperations"
+    then:
+      function: jrpayIdempotencyKeyRequired
+
+  # GP-PROBLEM-REGISTRY — every `urn:problem:*` URI referenced in
+  # operation descriptions, response descriptions, or examples must be
+  # registered in gui/architecture/PROBLEM_TYPES.md.
+  jrpay-problem-types-registered:
+    description: Problem-type URIs referenced in prose must be in the canonical registry.
+    message: "{{error}}"
+    severity: error
+    given:
+      - "$..description"
+      - "$..['x-problem-type']"
+    then:
+      function: jrpayProblemTypesRegistered
+      functionOptions:
+        registry:
+          - "urn:problem:account-balance-nonzero"
+          - "urn:problem:account-closed"
+          - "urn:problem:account-frozen"
+          - "urn:problem:already-returned"
+          - "urn:problem:amendment-not-allowed"
+          - "urn:problem:breached-password"
+          - "urn:problem:cannot-delete-self"
+          - "urn:problem:case-already-decided"
+          - "urn:problem:concurrent-limit"
+          - "urn:problem:consent-revoked"
+          - "urn:problem:consents-active"
+          - "urn:problem:currency-unsupported"
+          - "urn:problem:dependency-timeout"
+          - "urn:problem:duplicate-consent"
+          - "urn:problem:duplicate-iban"
+          - "urn:problem:duplicate-suspected"
+          - "urn:problem:dynamic-linking-mismatch"
+          - "urn:problem:email-in-use"
+          - "urn:problem:erasure-precondition-balance"
+          - "urn:problem:erasure-precondition-consents"
+          - "urn:problem:erasure-precondition-investigation"
+          - "urn:problem:export-not-ready"
+          - "urn:problem:generic-decline"
+          - "urn:problem:generic-regulatory"
+          - "urn:problem:hit-already-decided"
+          - "urn:problem:idempotency-key-conflict"
+          - "urn:problem:idempotency-key-missing"
+          - "urn:problem:instant-not-supported-for-currency"
+          - "urn:problem:insufficient-funds"
+          - "urn:problem:insufficient-funds-for-return"
+          - "urn:problem:invalid-amount"
+          - "urn:problem:invalid-class"
+          - "urn:problem:invalid-currency"
+          - "urn:problem:invalid-iban"
+          - "urn:problem:invalid-input"
+          - "urn:problem:merchant-not-in-registry"
+          - "urn:problem:password-requirements-unmet"
+          - "urn:problem:payload-too-large"
+          - "urn:problem:pending-execution"
+          - "urn:problem:phone-in-use"
+          - "urn:problem:r2p-already-acted"
+          - "urn:problem:r2p-cancelled"
+          - "urn:problem:r2p-expired"
+          - "urn:problem:rate-limit"
+          - "urn:problem:rate-limit-gdpr-request"
+          - "urn:problem:sca-factor-not-enrolled"
+          - "urn:problem:sca-locked"
+          - "urn:problem:sca-required"
+          - "urn:problem:sca-timeout"
+          - "urn:problem:session-expired"
+          - "urn:problem:session-hard-cap"
+          - "urn:problem:session-revoked"
+          - "urn:problem:signed-url-expired"
+          - "urn:problem:state-mismatch"
+          - "urn:problem:step-up-required"
+          - "urn:problem:temporarily-unavailable"
+          - "urn:problem:too-late-to-cancel"
+          - "urn:problem:too-many-sessions"
+          - "urn:problem:two-supervisor-required"
+          - "urn:problem:unexpected-error"
+          - "urn:problem:unknown-field"
+          - "urn:problem:unsupported-media-type"
+          - "urn:problem:vop-timeout"
+
+  # GP-SEC-REQUIRED — every authenticated operation declares `security:`.
+  # Public / oauth2 / discovery / SSE-with-stream-token endpoints are
+  # exempt (see function).
+  jrpay-security-required:
+    description: Operations must declare a `security:` block unless they are explicit-public or SSE-stream-token authed.
+    message: "{{error}}"
+    severity: error
+    given:
+      - "#AllOperations"
+    then:
+      function: jrpaySecurityRequired
+
+  # GP-RFC9457 — every 4xx / 5xx response on a non-OAuth2 path uses
+  # `application/problem+json` either directly or via a $ref to a shared
+  # Problem response in shared-schemas.yaml.
+  jrpay-rfc9457-error-format:
+    description: 4xx / 5xx responses must use application/problem+json (RFC 9457).
+    message: "{{error}}"
+    severity: error
+    given:
+      - "#AllOperations"
+    then:
+      function: jrpayRfc9457ErrorFormat
+
+  # GP-ENUMS-SHARED — inline enum declarations must not exactly duplicate
+  # a canonical enum from gui/architecture/SHARED_ENUMS.md. Duplicates
+  # drift; use $ref: "shared-schemas.yaml#/components/schemas/<Name>".
+  # Narrower subsets (e.g., status transition subsets) remain allowed.
+  # `resolved: false` ensures we scan genuine inline enums only — not
+  # enums inlined by the $ref resolver from shared-schemas.yaml.
+  jrpay-enums-match-shared:
+    description: Inline enums duplicating a canonical SHARED_ENUMS.md enum must $ref instead.
+    message: "{{error}}"
+    severity: warn
+    resolved: false
+    given:
+      - "$..enum"
+    then:
+      function: jrpayEnumsInShared
+
+  ############################################################
+  # spectral:oas-ruleset tightening — shorthand severity-only overrides.
+  ############################################################
+
+  # Every operation should have an operationId (used by generators to
+  # name client methods).
+  operation-operationId: error
+
+  # Tags help group operations in the generated docs.
+  operation-tag-defined: error
+
+  # operation-description remains at its built-in `warn` severity —
+  # some endpoints are self-documenting via `summary:` alone and we don't
+  # want to fail CI over prose style.
+
+  # Disable the OAS security-scheme-defined scope check — it does not
+  # resolve cross-file scope declarations in shared-schemas.yaml. Our
+  # `jrpay-security-required` rule covers the structural concern, and
+  # `prance + openapi-spec-validator` covers cross-file scope validity.
+  oas3-operation-security-defined: off
+
+  # Disable unused-component — Spectral can't see cross-file $refs or
+  # discriminator `mapping:` usages and produces false positives on
+  # shared-schemas.yaml components and on discriminator variants
+  # (ConsentSummaryPsd2 / ConsentSummaryVrp). Orphaned components are
+  # picked up by code review + the prance cross-file validator.
+  oas3-unused-component: off
+
+  # Keep info-contact optional — we don't publish a public contact.
+  info-contact: off
+
+  # info.license is documented in a central LICENSE file; avoid the
+  # per-spec boilerplate.
+  info-license: off

@@ -1,0 +1,617 @@
+openapi: 3.1.0
+info:
+  title: JRPay — Customer GDPR (Export + Erasure)
+  version: 1.0.0
+  description: |
+    Customer-facing GDPR self-service. Realises UC-G24 (Art. 15 data
+    export) and UC-G25 (Art. 17 account erasure).
+
+    **Export (UC-G24):** request → poll → download signed URL (24-h TTL
+    per `SIGNED_URL_CONVENTIONS.md`). Rate-limited to 1 / 7 days per
+    GDPR Art. 12(5) "manifestly excessive" clause.
+
+    **Erasure (UC-G25):** preflight → informed-consent checkbox → fresh
+    SCA with dynamic-linking class `gdpr-erasure` → submit → SSE-tracked
+    cascade across A1..A6 + identity → completion certificate PDF
+    (signed URL, 24-h TTL).
+
+    Hosted by A4's GDPR helper (per PROJECT_DECISIONS D5). The underlying
+    cascade already exists in backend code (crypto-shredding); this spec
+    adds the customer-facing trigger surface.
+
+    See `shared-schemas.yaml` for enums + Problem envelope + pagination.
+
+servers:
+  - url: "https://api.{env}.jrpay.example"
+    variables: { env: { default: dev } }
+  - url: "http://localhost:8094"
+    description: Local dev (A4 port)
+
+tags:
+  - name: GDPR-Export
+    description: UC-G24 — request, poll, download, cancel
+  - name: GDPR-Erasure
+    description: UC-G25 — preflight, submit, track, certificate
+  - name: GDPR-Stream
+    description: SSE for the erasure cascade
+
+paths:
+  #############################################################################
+  # Export (UC-G24)
+  #############################################################################
+  /api/v1/customer/gdpr/export:
+    post:
+      tags: [GDPR-Export]
+      summary: Request a GDPR data export (UC-G24 §6 step 3)
+      description: |
+        Creates an export request. Idempotent: repeated requests while one
+        is `PENDING` / `IN_PROGRESS` return the existing request's metadata
+        (UC-G24 AF-01). Rate-limited to 1 / 7 days per user (UC-G24 AF-02);
+        over-limit returns `429 urn:problem:rate-limit-gdpr-request`.
+      operationId: requestGdprExport
+      security:
+        - OAuth2Customer: [gdpr:export]
+      parameters:
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                scope:
+                  type: string
+                  enum: [ALL, PROFILE_AND_ACCOUNTS, TRANSACTIONS_ONLY]
+                  default: ALL
+                formatPref:
+                  type: array
+                  description: |
+                    Preferred formats (included when available). The ZIP
+                    always contains `profile.json`, `accounts.json`, and
+                    `README.md`; this list influences optional files.
+                  items:
+                    type: string
+                    enum: [PDF, JSON, CSV, CAMT053, XML]
+      responses:
+        "201":
+          description: Export queued.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/GdprExportRequest" }
+        "200":
+          description: |
+            Existing request returned unchanged (same customer, already
+            pending or recently delivered within the 7-day window).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/GdprExportRequest" }
+        "429":
+          description: urn:problem:rate-limit-gdpr-request
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+    get:
+      tags: [GDPR-Export]
+      summary: List the customer's recent export requests
+      operationId: listGdprExports
+      security:
+        - OAuth2Customer: [gdpr:export]
+      parameters:
+        - $ref: "shared-schemas.yaml#/components/parameters/PageNumber"
+        - $ref: "shared-schemas.yaml#/components/parameters/PageSize"
+      responses:
+        "200":
+          description: Paginated requests.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, page]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/GdprExportRequest" }
+                  page: { $ref: "shared-schemas.yaml#/components/schemas/PageMeta" }
+
+  /api/v1/customer/gdpr/export/{requestId}:
+    get:
+      tags: [GDPR-Export]
+      summary: Poll export-request status (UC-G24 §6 step 5)
+      operationId: getGdprExport
+      security:
+        - OAuth2Customer: [gdpr:export]
+      parameters:
+        - $ref: "#/components/parameters/ExportRequestId"
+      responses:
+        "200":
+          description: Status.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/GdprExportRequest" }
+        "404": { $ref: "shared-schemas.yaml#/components/responses/Problem404" }
+    delete:
+      tags: [GDPR-Export]
+      summary: Cancel a pending export
+      operationId: cancelGdprExport
+      security:
+        - OAuth2Customer: [gdpr:export]
+      parameters:
+        - $ref: "#/components/parameters/ExportRequestId"
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+      responses:
+        "204":
+          description: Cancelled.
+        "409":
+          description: urn:problem:pending-execution — export past the point of cancellation.
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+
+  /api/v1/customer/gdpr/export/{requestId}/download:
+    get:
+      tags: [GDPR-Export]
+      summary: Download the export ZIP (UC-G24 §6 step 8)
+      description: |
+        Returns a 302 redirect to a single-use signed URL with a 24-h TTL
+        (`SIGNED_URL_CONVENTIONS.md`). If the previously issued link is
+        past TTL, calling this endpoint issues a fresh one without
+        regenerating the ZIP (UC-G24 AF-04).
+      operationId: downloadGdprExport
+      security:
+        - OAuth2Customer: [gdpr:export]
+      parameters:
+        - $ref: "#/components/parameters/ExportRequestId"
+      responses:
+        "302":
+          description: Redirect to signed URL.
+          headers:
+            Location:
+              schema: { type: string, format: uri }
+        "404": { $ref: "shared-schemas.yaml#/components/responses/Problem404" }
+        "410":
+          description: urn:problem:signed-url-expired (export retention window passed)
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+        "425":
+          description: urn:problem:export-not-ready — still IN_PROGRESS.
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+
+  #############################################################################
+  # Erasure (UC-G25)
+  #############################################################################
+  /api/v1/customer/gdpr/erase/preflight:
+    get:
+      tags: [GDPR-Erasure]
+      summary: Erasure preflight — eligibility + blockers + what-will-happen (UC-G25 §6.2)
+      description: |
+        Runs the readiness check without committing. Returns whether erasure
+        can proceed, the specific blockers (non-zero balances, pending
+        R2Ps, in-flight payments, AML hold), and a preview of what will be
+        revoked + what will be retained.
+
+        Called every time the customer opens the erasure screen; cheap and
+        always fresh. No side-effects beyond a low-signal audit event.
+      operationId: gdprErasePreflight
+      security:
+        - OAuth2Customer: [gdpr:erase]
+      responses:
+        "200":
+          description: Preflight snapshot.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/GdprErasurePreflight" }
+
+  /api/v1/customer/gdpr/erase:
+    post:
+      tags: [GDPR-Erasure]
+      summary: Submit erasure request (UC-G25 §6.5 step 8)
+      description: |
+        Submits the erasure cascade. Requires:
+
+        - Fresh SCA (`acr=loa3` issued < 5 min ago) — server enforces by
+          checking the access token's `auth_time`.
+        - `Step-Up-Token` header whose `dl_hash` matches the body's
+          `{class:"gdpr-erasure", customerId, accountIds}`.
+        - `disclosureVersion` matching the currently published informed-
+          consent text (UC-G25 §6.3). Server returns `409` with the
+          current version if stale, so the client can re-render the
+          disclosure.
+
+        Returns `202` with the request id; the cascade is tracked via SSE
+        (see `/erase/{id}/stream`) or polled via `GET /erase/{id}`.
+      operationId: submitGdprErasure
+      security:
+        - OAuth2Customer: [gdpr:erase]
+      parameters:
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+        - $ref: "shared-schemas.yaml#/components/parameters/StepUpToken"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/GdprErasureSubmit" }
+      responses:
+        "202":
+          description: Erasure accepted; cascade in progress.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/GdprErasureRequest" }
+        "401":
+          description: |
+            `urn:problem:step-up-required` — SCA too old or missing.
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+        "403":
+          description: urn:problem:dynamic-linking-mismatch
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+        "409":
+          description: |
+            Blockers re-detected at submit time (UC-G25 AF-05) — e.g., a
+            new in-flight payment started between preflight and submit:
+            `details.blockers` carries the same shape as preflight.
+            Alternatively, `disclosureVersion` stale → server returns
+            its current version in `details.currentDisclosureVersion`.
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+        "410":
+          description: |
+            urn:problem:erasure-precondition-balance / -investigation
+            / -consents — cascaded precondition still unsatisfied even
+            though preflight said OK (very rare race).
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+        "422":
+          description: |
+            `urn:problem:erasure-precondition-balance` (non-zero balance),
+            `urn:problem:erasure-precondition-investigation` (AML hold,
+            UC-G25 AF-07), `urn:problem:erasure-precondition-consents`
+            (active consent) depending on the surviving blocker.
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+
+  /api/v1/customer/gdpr/erase/{requestId}:
+    get:
+      tags: [GDPR-Erasure]
+      summary: Get erasure-request status (UC-G25 §6.5)
+      operationId: getGdprErasure
+      security:
+        - OAuth2Customer: [gdpr:erase]
+      parameters:
+        - $ref: "#/components/parameters/ErasureRequestId"
+      responses:
+        "200":
+          description: Status.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/GdprErasureRequest" }
+        "404": { $ref: "shared-schemas.yaml#/components/responses/Problem404" }
+
+  /api/v1/customer/gdpr/erase/{requestId}/stream-token:
+    post:
+      tags: [GDPR-Stream]
+      summary: Acquire one-time SSE stream token for cascade progress
+      operationId: erasureStreamToken
+      security:
+        - OAuth2Customer: [gdpr:erase]
+      parameters:
+        - $ref: "#/components/parameters/ErasureRequestId"
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+      responses:
+        "200":
+          description: Stream token.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [streamToken, expiresIn]
+                properties:
+                  streamToken: { type: string }
+                  expiresIn: { type: integer, example: 300 }
+
+  /api/v1/customer/gdpr/erase/{requestId}/stream:
+    get:
+      tags: [GDPR-Stream]
+      summary: Cascade progress SSE stream (UC-G25 §6.5 step 10)
+      description: |
+        Events: `erasure.step.started`, `erasure.step.done`,
+        `erasure.step.failed`, `erasure.completed`, `erasure.failed`.
+        Heartbeat 15 s. Single-use stream token.
+      operationId: erasureStream
+      parameters:
+        - $ref: "#/components/parameters/ErasureRequestId"
+        - name: token
+          in: query
+          required: true
+          schema: { type: string }
+        - name: Last-Event-ID
+          in: header
+          required: false
+          schema: { type: string }
+      responses:
+        "200":
+          description: text/event-stream
+          content:
+            text/event-stream:
+              schema: { type: string }
+
+  /api/v1/customer/gdpr/erase/{requestId}/certificate:
+    get:
+      tags: [GDPR-Erasure]
+      summary: Download the completion certificate PDF (UC-G25 §6.7)
+      description: |
+        Returns a 302 to a signed URL with a 24-h TTL. The certificate is
+        not PII (request id + cascade timestamp + cryptographic attestation).
+        One additional issuance is allowed via `re-request=true` during the
+        session (UC-G25 §12 "downloadable only once during the session").
+      operationId: erasureCertificate
+      security:
+        - OAuth2Customer: [gdpr:erase]
+      parameters:
+        - $ref: "#/components/parameters/ErasureRequestId"
+        - name: re-request
+          in: query
+          description: Request a fresh signed URL after the original was consumed.
+          schema: { type: boolean, default: false }
+      responses:
+        "302":
+          description: Redirect to signed URL.
+          headers:
+            Location:
+              schema: { type: string, format: uri }
+        "404": { $ref: "shared-schemas.yaml#/components/responses/Problem404" }
+        "410":
+          description: urn:problem:signed-url-expired
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+        "425":
+          description: urn:problem:export-not-ready — cascade not yet COMPLETED.
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+
+components:
+  securitySchemes:
+    OAuth2Customer:
+      $ref: "shared-schemas.yaml#/components/securitySchemes/OAuth2Customer"
+
+  parameters:
+    ExportRequestId:
+      name: requestId
+      in: path
+      required: true
+      schema: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+    ErasureRequestId:
+      name: requestId
+      in: path
+      required: true
+      schema: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+
+  schemas:
+    ############################################################
+    # Export
+    ############################################################
+    GdprExportRequest:
+      type: object
+      required: [requestId, status, requestedAt]
+      properties:
+        requestId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+        status: { $ref: "shared-schemas.yaml#/components/schemas/GdprRequestStatus" }
+        requestedAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        estimatedReady: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        progress:
+          type: integer
+          minimum: 0
+          maximum: 100
+        artefactSizeBytes:
+          type: integer
+          minimum: 0
+        downloadUrl:
+          description: Present only when status is READY and the link is live.
+          type: string
+          format: uri
+        downloadExpiresAt:
+          $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant"
+        failureReason:
+          description: Present when status is FAILED.
+          type: string
+        rateLimitResetAt:
+          description: |
+            When `status` returned was effectively a no-op (existing
+            request), this carries the instant at which the 7-day window
+            resets and a fresh request is allowed.
+          $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant"
+
+    ############################################################
+    # Erasure preflight + submit
+    ############################################################
+    GdprErasurePreflight:
+      type: object
+      required:
+        - eligible
+        - disclosureVersion
+        - willRevoke
+        - willRetain
+      properties:
+        eligible: { type: boolean }
+        blockers:
+          type: array
+          items: { $ref: "#/components/schemas/GdprErasureBlocker" }
+        disclosureVersion:
+          type: string
+          description: |
+            Version id of the informed-consent text the client must show
+            and the customer must acknowledge. Submits must echo this
+            value; mismatches re-open the disclosure.
+          example: "2026-04-24.v3"
+        willRevoke:
+          type: object
+          properties:
+            mandates:
+              type: array
+              items:
+                type: object
+                required: [mandateId, merchantName]
+                properties:
+                  mandateId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+                  merchantName: { $ref: "shared-schemas.yaml#/components/schemas/Name" }
+            consents:
+              type: array
+              items:
+                type: object
+                required: [consentId, kind]
+                properties:
+                  consentId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+                  kind: { type: string, enum: [PSD2, VRP] }
+                  counterparty: { $ref: "shared-schemas.yaml#/components/schemas/Name" }
+            trustedBeneficiaries:
+              type: array
+              items:
+                type: object
+                required: [beneficiaryId, name]
+                properties:
+                  beneficiaryId: { type: string }
+                  name: { $ref: "shared-schemas.yaml#/components/schemas/Name" }
+        willRetain:
+          type: object
+          required: [transactionEventsForYears, auditEventsForYears, explanationKey]
+          properties:
+            transactionEventsForYears:
+              type: integer
+              example: 5
+            auditEventsForYears:
+              type: integer
+              example: 5
+            explanationKey:
+              type: string
+              description: i18n catalogue key for the plain-language explanation.
+
+    GdprErasureBlocker:
+      type: object
+      required: [type]
+      properties:
+        type:
+          type: string
+          enum:
+            - NON_ZERO_BALANCE
+            - OPEN_R2P_PENDING
+            - IN_FLIGHT_PAYMENT
+            - ACTIVE_INVESTIGATION
+            - AML_HOLD
+            - OPEN_FRAUD_CASE
+            - OTHER
+        accountId: { type: string }
+        balance: { $ref: "shared-schemas.yaml#/components/schemas/MonetaryAmount" }
+        currency: { $ref: "shared-schemas.yaml#/components/schemas/Currency" }
+        requestId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+        paymentId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+        caseId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+        detailKey:
+          type: string
+          description: i18n key for a specific copy override (e.g. AML neutral text).
+        resolveActionHint:
+          type: string
+          enum:
+            - TRANSFER_RESIDUAL_OUT
+            - DECLINE_OR_DEFER_R2P
+            - WAIT_PAYMENT_FINALISE
+            - CONTACT_SUPPORT
+
+    GdprErasureSubmit:
+      type: object
+      required: [disclosureVersion, acknowledge, customerId, accountIds]
+      additionalProperties: false
+      properties:
+        disclosureVersion:
+          type: string
+          description: Value echoed from preflight (UC-G25 §6.3).
+        acknowledge:
+          type: boolean
+          description: Must be `true` — mirrors the required checkbox.
+        customerId:
+          type: string
+          description: |
+            Customer identifier — included explicitly so the dynamic-
+            linking proof (class `gdpr-erasure`) binds to this value.
+            Must match the subject of the access token.
+        accountIds:
+          type: array
+          description: |
+            All account ids the customer owns (sorted lexicographically
+            per DYNAMIC_LINKING.md rule 7). Used in the `dl_hash` input.
+          items: { type: string }
+        finalContactEmail:
+          type: string
+          description: |
+            Optional alternate email for the final confirmation (UC-G25
+            AF-08). If absent, the last-known profile email is used.
+          format: email
+
+    GdprErasureRequest:
+      type: object
+      required: [requestId, status, submittedAt, steps]
+      properties:
+        requestId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+        status: { $ref: "shared-schemas.yaml#/components/schemas/GdprRequestStatus" }
+        submittedAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        startedAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        completedAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        certificateAvailable:
+          type: boolean
+          description: |
+            `true` when the completion certificate is ready for download.
+        steps:
+          type: array
+          description: |
+            Cascade steps shown in UC-G25 tracking screen. Order matches
+            UC-G25 §6.6 (identity → A4 → A3 → A6 → A2 → A1 → A5 → audit
+            → identity final → notifications).
+          items: { $ref: "#/components/schemas/ErasureStep" }
+        failureReason:
+          type: string
+          description: Present when `status=FAILED`.
+        supportReference:
+          type: string
+
+    ErasureStep:
+      type: object
+      required: [service, label, status]
+      properties:
+        service:
+          type: string
+          enum:
+            - identity
+            - a4-psd2
+            - a3-billpay
+            - a6-vop
+            - a2-clearing
+            - a1-ledger
+            - a5-fraud
+            - audit-query
+            - identity-final
+            - notifications
+        label:
+          type: string
+          description: i18n-renderable label key (e.g. `gdpr.erase.step.a1-ledger`).
+        status:
+          type: string
+          enum: [WAITING, RUNNING, DONE, FAILED, SKIPPED]
+        startedAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        completedAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        retries:
+          type: integer
+          minimum: 0
+        errorKey:
+          type: string
+          description: Localised error-key if FAILED.

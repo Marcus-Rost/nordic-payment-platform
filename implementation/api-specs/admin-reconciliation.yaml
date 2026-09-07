@@ -1,0 +1,535 @@
+openapi: 3.1.0
+info:
+  title: JRPay — Admin Reconciliation
+  version: 1.0.0
+  description: |
+    Admin-facing reconciliation dashboard, discrepancy management, and
+    on-demand run trigger. Realises UC-G39.
+
+    Hosted by A1's reconciliation service. Triggering a run requires
+    step-up SCA (`action=RUN_RECONCILIATION`); resolving a discrepancy
+    requires step-up SCA (`action=RESOLVE_DISCREPANCY`).
+
+    Uploads use `multipart/form-data` with either camt.053 XML or CSV.
+    Run progress is surfaced via per-run SSE (`/runs/{id}/stream`).
+
+    See `shared-schemas.yaml` for enums + Problem envelope + pagination.
+
+servers:
+  - url: "https://admin-api.{env}.jrpay.example"
+    variables: { env: { default: dev } }
+  - url: "http://localhost:8091"
+    description: Local dev (A1 port)
+
+tags:
+  - name: Reconciliation-Summary
+    description: UC-G39 §6.1 — per-day summary dashboard
+  - name: Reconciliation-Discrepancies
+    description: UC-G39 §6.2 — list / detail / resolve
+  - name: Reconciliation-Run
+    description: UC-G39 §6.3 — on-demand run + per-run SSE
+  - name: Reconciliation-Runs
+    description: Run metadata (listing, detail, polling)
+
+paths:
+  #############################################################################
+  # Summary
+  #############################################################################
+  /api/v1/admin/reconciliation/summary:
+    get:
+      tags: [Reconciliation-Summary]
+      summary: Per-day reconciliation summary (UC-G39 §6.1)
+      description: |
+        Returns a single-day snapshot by default; with `from`/`to` the
+        response includes the full range. The dashboard page calls this
+        once per day-picker change.
+      operationId: getReconciliationSummary
+      security:
+        - OAuth2Admin: [reconciliation:read]
+      parameters:
+        - name: date
+          in: query
+          description: ISO date; defaults to today in service TZ.
+          schema: { $ref: "shared-schemas.yaml#/components/schemas/LocalDate" }
+        - name: from
+          in: query
+          schema: { $ref: "shared-schemas.yaml#/components/schemas/LocalDate" }
+        - name: to
+          in: query
+          schema: { $ref: "shared-schemas.yaml#/components/schemas/LocalDate" }
+      responses:
+        "200":
+          description: Summary.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ReconciliationSummary" }
+
+  #############################################################################
+  # Discrepancies
+  #############################################################################
+  /api/v1/admin/reconciliation/discrepancies:
+    get:
+      tags: [Reconciliation-Discrepancies]
+      summary: List discrepancies (UC-G39 §6.2)
+      operationId: listDiscrepancies
+      security:
+        - OAuth2Admin: [reconciliation:read]
+      parameters:
+        - name: date
+          in: query
+          schema: { $ref: "shared-schemas.yaml#/components/schemas/LocalDate" }
+        - name: type
+          in: query
+          schema:
+            type: array
+            items: { $ref: "#/components/schemas/DiscrepancyType" }
+          style: form
+          explode: true
+        - name: status
+          in: query
+          schema:
+            type: array
+            items:
+              type: string
+              enum: [OPEN, INVESTIGATING, RESOLVED]
+          style: form
+          explode: true
+        - name: runId
+          in: query
+          description: Scope to a specific reconciliation run.
+          schema: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+        - $ref: "shared-schemas.yaml#/components/parameters/PageNumber"
+        - $ref: "shared-schemas.yaml#/components/parameters/PageSize"
+        - $ref: "shared-schemas.yaml#/components/parameters/SortAsc"
+      responses:
+        "200":
+          description: Paginated discrepancies.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, page]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/Discrepancy" }
+                  page: { $ref: "shared-schemas.yaml#/components/schemas/PageMeta" }
+
+  /api/v1/admin/reconciliation/discrepancies/{discrepancyId}:
+    get:
+      tags: [Reconciliation-Discrepancies]
+      summary: Discrepancy detail
+      operationId: getDiscrepancy
+      security:
+        - OAuth2Admin: [reconciliation:read]
+      parameters:
+        - $ref: "#/components/parameters/DiscrepancyId"
+      responses:
+        "200":
+          description: Discrepancy detail.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DiscrepancyDetail" }
+        "404": { $ref: "shared-schemas.yaml#/components/responses/Problem404" }
+
+  /api/v1/admin/reconciliation/discrepancies/{discrepancyId}/resolve:
+    post:
+      tags: [Reconciliation-Discrepancies]
+      summary: Mark discrepancy resolved (UC-G39 §6.2)
+      description: |
+        Step-up SCA required (`action=RESOLVE_DISCREPANCY`). Notes ≥ 50
+        chars. Resolution is idempotent — marking an already-resolved row
+        returns `200` with the current state.
+      operationId: resolveDiscrepancy
+      security:
+        - OAuth2Admin: [reconciliation:run]
+      parameters:
+        - $ref: "#/components/parameters/DiscrepancyId"
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+        - $ref: "shared-schemas.yaml#/components/parameters/StepUpToken"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/DiscrepancyResolveRequest" }
+      responses:
+        "200":
+          description: Resolved.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DiscrepancyDetail" }
+        "403":
+          description: urn:problem:dynamic-linking-mismatch
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+        "404": { $ref: "shared-schemas.yaml#/components/responses/Problem404" }
+
+  #############################################################################
+  # Runs
+  #############################################################################
+  /api/v1/admin/reconciliation/run:
+    post:
+      tags: [Reconciliation-Run]
+      summary: Trigger on-demand reconciliation (UC-G39 §6.3)
+      description: |
+        Accepts either a multipart upload of a camt.053 XML / CSV file,
+        or a JSON body referencing a pre-uploaded report (from the
+        scheduled drops). Step-up SCA required (`action=RUN_RECONCILIATION`).
+        Idempotent on file hash (AF-04): re-running the same file returns
+        the existing run's id.
+
+        Returns `202` with a `runId`; subscribe to `/runs/{id}/stream` for
+        progress or poll `GET /runs/{id}`.
+      operationId: triggerReconciliationRun
+      security:
+        - OAuth2Admin: [reconciliation:run]
+      parameters:
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+        - $ref: "shared-schemas.yaml#/components/parameters/StepUpToken"
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema: { $ref: "#/components/schemas/ReconciliationRunMultipartRequest" }
+          application/json:
+            schema: { $ref: "#/components/schemas/ReconciliationRunJsonRequest" }
+      responses:
+        "202":
+          description: Run queued.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ReconciliationRun" }
+        "200":
+          description: |
+            Idempotent re-run detected (same file hash); existing run
+            state is returned unchanged.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ReconciliationRun" }
+        "400":
+          description: |
+            Malformed camt.053 / CSV. `details.parseErrors` is an array of
+            `{line, column, message}` entries so the UI can render inline
+            errors.
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+        "413":
+          description: urn:problem:payload-too-large — > 100 MB.
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+        "415":
+          description: urn:problem:unsupported-media-type
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+
+  /api/v1/admin/reconciliation/runs:
+    get:
+      tags: [Reconciliation-Runs]
+      summary: List recent runs
+      operationId: listReconciliationRuns
+      security:
+        - OAuth2Admin: [reconciliation:read]
+      parameters:
+        - name: from
+          in: query
+          schema: { $ref: "shared-schemas.yaml#/components/schemas/LocalDate" }
+        - name: to
+          in: query
+          schema: { $ref: "shared-schemas.yaml#/components/schemas/LocalDate" }
+        - $ref: "shared-schemas.yaml#/components/parameters/PageNumber"
+        - $ref: "shared-schemas.yaml#/components/parameters/PageSize"
+      responses:
+        "200":
+          description: Paginated runs.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, page]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/ReconciliationRun" }
+                  page: { $ref: "shared-schemas.yaml#/components/schemas/PageMeta" }
+
+  /api/v1/admin/reconciliation/runs/{runId}:
+    get:
+      tags: [Reconciliation-Runs]
+      summary: Get reconciliation-run detail (poll)
+      operationId: getReconciliationRun
+      security:
+        - OAuth2Admin: [reconciliation:read]
+      parameters:
+        - $ref: "#/components/parameters/RunId"
+      responses:
+        "200":
+          description: Run detail.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ReconciliationRun" }
+        "404": { $ref: "shared-schemas.yaml#/components/responses/Problem404" }
+
+  /api/v1/admin/reconciliation/runs/{runId}/stream-token:
+    post:
+      tags: [Reconciliation-Run]
+      summary: One-time SSE stream token for a run
+      operationId: reconciliationRunStreamToken
+      security:
+        - OAuth2Admin: [reconciliation:read]
+      parameters:
+        - $ref: "#/components/parameters/RunId"
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+      responses:
+        "200":
+          description: Stream token.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [streamToken, expiresIn]
+                properties:
+                  streamToken: { type: string }
+                  expiresIn: { type: integer, example: 300 }
+
+  /api/v1/admin/reconciliation/runs/{runId}/stream:
+    get:
+      tags: [Reconciliation-Run]
+      summary: Run-progress SSE
+      description: |
+        Events: `run.progress` (with percent-complete), `run.completed`,
+        `run.failed`. Heartbeat 15 s; single-use token.
+      operationId: reconciliationRunStream
+      parameters:
+        - $ref: "#/components/parameters/RunId"
+        - name: token
+          in: query
+          required: true
+          schema: { type: string }
+        - name: Last-Event-ID
+          in: header
+          required: false
+          schema: { type: string }
+      responses:
+        "200":
+          description: text/event-stream
+          content:
+            text/event-stream:
+              schema: { type: string }
+
+components:
+  securitySchemes:
+    OAuth2Admin:
+      $ref: "shared-schemas.yaml#/components/securitySchemes/OAuth2Admin"
+
+  parameters:
+    DiscrepancyId:
+      name: discrepancyId
+      in: path
+      required: true
+      schema: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+    RunId:
+      name: runId
+      in: path
+      required: true
+      schema: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+
+  schemas:
+    DiscrepancyType:
+      type: string
+      enum:
+        - MISSING_INTERNAL
+        - MISSING_EXTERNAL
+        - AMOUNT_MISMATCH
+        - REFERENCE_MISMATCH
+        - DUPLICATE_EXTERNAL
+
+    ReconciliationSummary:
+      type: object
+      required: [days, trend]
+      properties:
+        days:
+          type: array
+          items: { $ref: "#/components/schemas/ReconciliationDay" }
+        trend:
+          type: array
+          description: 30-day sparkline data; each entry is a day aggregate.
+          items:
+            type: object
+            required: [date, totalVolume, discrepancyCount]
+            properties:
+              date: { $ref: "shared-schemas.yaml#/components/schemas/LocalDate" }
+              totalVolume: { $ref: "shared-schemas.yaml#/components/schemas/MonetaryAmount" }
+              currency: { $ref: "shared-schemas.yaml#/components/schemas/Currency" }
+              discrepancyCount: { type: integer, minimum: 0 }
+
+    ReconciliationDay:
+      type: object
+      required: [date, reconciled, unreconciled, discrepancies, currency]
+      properties:
+        date: { $ref: "shared-schemas.yaml#/components/schemas/LocalDate" }
+        reconciled:
+          type: object
+          required: [count, amount]
+          properties:
+            count: { type: integer, minimum: 0 }
+            amount: { $ref: "shared-schemas.yaml#/components/schemas/MonetaryAmount" }
+        unreconciled:
+          type: object
+          required: [count, amount]
+          properties:
+            count: { type: integer, minimum: 0 }
+            amount: { $ref: "shared-schemas.yaml#/components/schemas/MonetaryAmount" }
+        discrepancies:
+          type: object
+          required: [count, amount]
+          properties:
+            count: { type: integer, minimum: 0 }
+            amount: { $ref: "shared-schemas.yaml#/components/schemas/MonetaryAmount" }
+        currency: { $ref: "shared-schemas.yaml#/components/schemas/Currency" }
+        lastRunAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+
+    Discrepancy:
+      type: object
+      required:
+        - discrepancyId
+        - type
+        - status
+        - date
+        - expectedAmount
+        - actualAmount
+        - currency
+        - detectedAt
+      properties:
+        discrepancyId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+        type: { $ref: "#/components/schemas/DiscrepancyType" }
+        status:
+          type: string
+          enum: [OPEN, INVESTIGATING, RESOLVED]
+        date: { $ref: "shared-schemas.yaml#/components/schemas/LocalDate" }
+        runId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+        externalReference: { type: string }
+        internalPaymentId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+        expectedAmount: { $ref: "shared-schemas.yaml#/components/schemas/MonetaryAmount" }
+        actualAmount: { $ref: "shared-schemas.yaml#/components/schemas/MonetaryAmount" }
+        currency: { $ref: "shared-schemas.yaml#/components/schemas/Currency" }
+        detectedAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        assignee:
+          type: string
+          nullable: true
+
+    DiscrepancyDetail:
+      allOf:
+        - $ref: "#/components/schemas/Discrepancy"
+        - type: object
+          properties:
+            externalRecord:
+              type: object
+              description: Raw external record as ingested from camt.053 / CSV.
+              additionalProperties: true
+            internalRecord:
+              type: object
+              description: |
+                Matching internal record (if any). Null for MISSING_INTERNAL.
+              additionalProperties: true
+            matchScore:
+              description: |
+                0..1 similarity score the matcher produced; 1 would have
+                been a perfect match.
+              type: number
+              minimum: 0
+              maximum: 1
+            resolution:
+              description: Present once `status=RESOLVED`.
+              type: object
+              properties:
+                resolvedBy: { type: string }
+                resolvedAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+                notesSummary: { type: string, maxLength: 140 }
+
+    DiscrepancyResolveRequest:
+      type: object
+      required: [notes, confirmedCriteria]
+      additionalProperties: false
+      properties:
+        resolutionCode:
+          type: string
+          enum:
+            - MATCHED_MANUALLY
+            - EXTERNAL_ERROR
+            - INTERNAL_FIX_APPLIED
+            - WRITTEN_OFF
+            - OTHER
+        notes:
+          type: string
+          minLength: 50
+          maxLength: 2000
+        confirmedCriteria: { type: boolean }
+
+    ReconciliationRun:
+      type: object
+      required: [runId, status, triggeredBy, source, startedAt]
+      properties:
+        runId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+        status:
+          type: string
+          enum: [QUEUED, RUNNING, COMPLETED, FAILED, CANCELLED]
+        triggeredBy:
+          type: string
+          description: Operator id or `system:scheduler`.
+        source:
+          type: string
+          enum: [UPLOAD_CAMT053, UPLOAD_CSV, SCHEDULED_REPORT]
+        fileName: { type: string }
+        fileHash:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+          description: SHA-256 of the raw upload; used for idempotency.
+        fileSizeBytes:
+          type: integer
+          minimum: 0
+        clearingDate: { $ref: "shared-schemas.yaml#/components/schemas/LocalDate" }
+        startedAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        completedAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        progress:
+          type: integer
+          minimum: 0
+          maximum: 100
+        recordsTotal: { type: integer, minimum: 0 }
+        recordsProcessed: { type: integer, minimum: 0 }
+        matched: { type: integer, minimum: 0 }
+        unmatched: { type: integer, minimum: 0 }
+        discrepanciesCreated: { type: integer, minimum: 0 }
+        failureReason: { type: string }
+
+    ReconciliationRunJsonRequest:
+      type: object
+      required: [scheduledReportId, clearingDate]
+      additionalProperties: false
+      properties:
+        scheduledReportId:
+          type: string
+          description: Id of a previously dropped report on the backend.
+        clearingDate: { $ref: "shared-schemas.yaml#/components/schemas/LocalDate" }
+        notes:
+          type: string
+          maxLength: 280
+
+    ReconciliationRunMultipartRequest:
+      type: object
+      required: [file, format, clearingDate]
+      properties:
+        file:
+          type: string
+          format: binary
+          description: camt.053 XML or CSV.
+        format:
+          type: string
+          enum: [CAMT053, CSV]
+        clearingDate: { $ref: "shared-schemas.yaml#/components/schemas/LocalDate" }
+        notes:
+          type: string
+          maxLength: 280

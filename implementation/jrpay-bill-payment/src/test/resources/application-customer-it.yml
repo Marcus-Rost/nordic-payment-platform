@@ -1,0 +1,39 @@
+spring:
+  application:
+    name: jrpay-bill-payment-customer-it
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    open-in-view: false
+    show-sql: false
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+  kafka:
+    bootstrap-servers: localhost:9092
+    producer:
+      acks: all
+  autoconfigure:
+    exclude:
+      - org.springframework.boot.autoconfigure.kafka.KafkaAutoConfiguration
+
+server:
+  port: 0
+management:
+  server:
+    port: 0
+
+jrpay:
+  billpay:
+    jwt:
+      jwks-uri: http://localhost:8097/oauth2/jwks
+    identity:
+      base-url: http://localhost:8097
+      client-id: jrpay-a3-service
+      client-secret: a3-service-secret
+
+logging:
+  level:
+    root: WARN
+    com.jrpay: INFO
+    org.flywaydb: INFO

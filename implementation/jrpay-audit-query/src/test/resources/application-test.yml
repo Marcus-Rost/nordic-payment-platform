@@ -1,0 +1,48 @@
+spring:
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    properties:
+      hibernate.jdbc.time_zone: UTC
+  flyway:
+    enabled: true
+  kafka:
+    bootstrap-servers: localhost:9092
+    consumer:
+      auto-offset-reset: earliest
+      enable-auto-commit: false
+    listener:
+      missing-topics-fatal: false
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          jwk-set-uri: http://localhost:65535/oauth2/jwks
+
+server:
+  port: 0
+
+management:
+  server:
+    port: -1
+
+jrpay:
+  audit:
+    kafka:
+      topic: audit.events
+    chain:
+      checkpoint-batch-size: 1000
+      verify-max-events: 100000
+    search:
+      hard-cap: 10000
+      default-window-hours: 24
+    export:
+      max-rows: 100000
+      signed-url-ttl: PT1H
+      signing-key: test-only-signing-key-do-not-use-in-prod-32!!
+      signed-base-url: http://localhost/test/audit/export-bin
+
+logging:
+  level:
+    root: WARN
+    com.jrpay: INFO

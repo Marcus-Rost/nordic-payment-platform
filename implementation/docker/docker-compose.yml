@@ -1,0 +1,308 @@
+# JRPay platform — full development stack.
+#
+# Brings up:
+#   - kafka (KRaft, single broker) + postgres (single instance, db-per-service)
+#   - kafka-init (one-shot) creates all backend + GUI-tier topics
+#   - 7 backend Spring Boot services (A1, A2, A3, A4, A5, A6, identity)
+#   - notifications-service + audit-query-service (Phase 2 additions)
+#   - admin-web + client-web nginx placeholders (Phase 3+ replaces these)
+#
+# Build context for every service is `..` (the implementation/ directory) so
+# the multi-module Gradle build sees all sources. The MODULE arg selects what
+# to package per the shared Dockerfile.service.
+
+services:
+  # === Infrastructure ===
+
+  kafka:
+    image: confluentinc/cp-kafka:7.7.0
+    hostname: kafka
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: 'broker,controller'
+      KAFKA_CONTROLLER_QUORUM_VOTERS: '1@kafka:29093'
+      KAFKA_LISTENERS: 'PLAINTEXT://kafka:29092,CONTROLLER://kafka:29093,EXTERNAL://0.0.0.0:9092'
+      KAFKA_ADVERTISED_LISTENERS: 'PLAINTEXT://kafka:29092,EXTERNAL://localhost:9092'
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: 'PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT'
+      KAFKA_CONTROLLER_LISTENER_NAMES: 'CONTROLLER'
+      KAFKA_INTER_BROKER_LISTENER_NAME: 'PLAINTEXT'
+      CLUSTER_ID: 'jrpay-dev-cluster-001'
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+      KAFKA_LOG_RETENTION_HOURS: 168
+      KAFKA_HEAP_OPTS: '-Xmx512m -Xms256m'
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "kafka:29092"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  postgres:
+    image: postgres:16-alpine
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: jrpay
+      POSTGRES_PASSWORD: jrpay
+      POSTGRES_DB: jrpay
+    volumes:
+      - ./init-databases.sql:/docker-entrypoint-initdb.d/init.sql
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U jrpay"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    command: postgres -c max_connections=200 -c shared_buffers=128MB
+
+  kafka-init:
+    image: confluentinc/cp-kafka:7.7.0
+    depends_on:
+      kafka:
+        condition: service_healthy
+    volumes:
+      - ./create-topics.sh:/usr/local/bin/create-topics.sh:ro
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+    entrypoint: ["sh", "/usr/local/bin/create-topics.sh"]
+    restart: "no"
+
+  # === Spring Boot services ===
+
+  identity:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.service
+      args:
+        MODULE: jrpay-identity-service
+    hostname: identity
+    ports:
+      - "8097:8097"
+      - "9097:9097"
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      MGMT_PORT: 9097
+      JRPAY_IDENTITY_ISSUER: http://identity:8097
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+
+  account-ledger:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.service
+      args:
+        MODULE: jrpay-account-ledger
+    hostname: account-ledger
+    ports:
+      - "8091:8091"
+      - "9091:9091"
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      MGMT_PORT: 9091
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      identity:
+        condition: service_started
+
+  clearing-engine:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.service
+      args:
+        MODULE: jrpay-clearing-engine
+    hostname: clearing-engine
+    ports:
+      - "8112:8112"
+      - "9112:9112"
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      MGMT_PORT: 9112
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+
+  bill-payment:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.service
+      args:
+        MODULE: jrpay-bill-payment
+    hostname: bill-payment
+    ports:
+      - "8093:8093"
+      - "9093:9093"
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      MGMT_PORT: 9093
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      identity:
+        condition: service_started
+
+  psd2-api:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.service
+      args:
+        MODULE: jrpay-psd2-api
+    hostname: psd2-api
+    ports:
+      - "8094:8094"
+      - "9094:9094"
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      MGMT_PORT: 9094
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      identity:
+        condition: service_started
+      vop:
+        condition: service_started
+
+  fraud-detection:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.service
+      args:
+        MODULE: jrpay-fraud-detection
+    hostname: fraud-detection
+    ports:
+      - "8095:8095"
+      - "9095:9095"
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      MGMT_PORT: 9095
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      identity:
+        condition: service_started
+
+  vop:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.service
+      args:
+        MODULE: jrpay-vop-service
+    hostname: vop
+    ports:
+      - "8096:8096"
+      - "9096:9096"
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      MGMT_PORT: 9096
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  notifications:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.service
+      args:
+        MODULE: jrpay-notifications
+    hostname: notifications
+    ports:
+      - "8098:8098"
+      - "9098:9098"
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      MGMT_PORT: 9098
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      identity:
+        condition: service_started
+
+  audit-query:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.service
+      args:
+        MODULE: jrpay-audit-query
+    hostname: audit-query
+    ports:
+      - "8099:8099"
+      - "9099:9099"
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      MGMT_PORT: 9099
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      identity:
+        condition: service_started
+
+  # === Web placeholders ===
+
+  admin-web:
+    build:
+      context: ..
+      dockerfile: admin-web/Dockerfile
+    ports:
+      - "5174:80"
+    depends_on:
+      identity:
+        condition: service_started
+      account-ledger:
+        condition: service_started
+      fraud-detection:
+        condition: service_started
+      audit-query:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  client-web:
+    build:
+      context: ..
+      dockerfile: client-web/Dockerfile
+    ports:
+      - "5173:80"
+    depends_on:
+      identity:
+        condition: service_started
+      account-ledger:
+        condition: service_started
+      bill-payment:
+        condition: service_started
+      psd2-api:
+        condition: service_started
+      notifications:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  postgres-data:

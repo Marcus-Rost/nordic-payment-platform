@@ -1,0 +1,64 @@
+spring:
+  application:
+    name: jrpay-fraud-detection
+
+  datasource:
+    url: jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5432}/casework
+    username: ${DB_USER:jrpay}
+    password: ${DB_PASSWORD:jrpay}
+    hikari:
+      maximum-pool-size: 8
+      minimum-idle: 2
+      connection-timeout: 5000
+
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    open-in-view: false
+
+  flyway:
+    enabled: true
+
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP:localhost:9092}
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+      acks: all
+      properties:
+        enable.idempotence: true
+
+server:
+  port: 8095
+
+management:
+  server:
+    port: 9095
+  endpoints:
+    web:
+      exposure:
+        include: health,readiness,prometheus
+
+jrpay:
+  fraud:
+    jwt:
+      jwks-uri: ${JRPAY_FRAUD_JWKS_URI:http://localhost:8097/oauth2/jwks}
+    identity:
+      base-url: ${JRPAY_FRAUD_IDENTITY_BASE_URL:http://localhost:8097}
+      client-id: ${JRPAY_FRAUD_IDENTITY_CLIENT_ID:jrpay-a5-service}
+      client-secret: ${JRPAY_FRAUD_IDENTITY_CLIENT_SECRET:a5-service-secret}
+    kafka:
+      group-id: jrpay-fraud-detection
+      fraud-check-response-topic: payment.fraud-check-response
+      sanctions-topic: sanctions.hits
+    case:
+      sla: PT4H
+    sanctions:
+      sla: PT2H
+    bulk-decide:
+      cooldown: PT1M
+    fp-cache:
+      ttl-days: 90
+    stream:
+      ttl: PT5M
+      heartbeat-ms: 15000

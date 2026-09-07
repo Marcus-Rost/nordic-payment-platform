@@ -1,0 +1,4 @@
+com.jrpay.starter.security.DefaultSecurityAutoConfiguration
+com.jrpay.starter.security.SecurityHeadersAutoConfiguration
+com.jrpay.starter.error.ErrorHandlerAutoConfiguration
+com.jrpay.starter.audit.AuditAutoConfiguration

@@ -1,0 +1,84 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">JRPay</string>
+    <string name="login_title">Logg inn</string>
+    <string name="login_subtitle">Logg inn med BankID for å åpne nettbanken.</string>
+    <string name="login_continue_with_bankid">Fortsett med BankID</string>
+    <string name="login_sca_notice">Pengetransaksjoner krever BankID-bekreftelse.</string>
+
+    <string name="nav_dashboard">Oversikt</string>
+    <string name="nav_payments">Betalinger</string>
+    <string name="nav_r2p">Forespørsler</string>
+    <string name="nav_more">Mer</string>
+
+    <string name="dashboard_title">Velkommen tilbake</string>
+    <string name="dashboard_total_balance">Total saldo</string>
+    <string name="dashboard_recent_activity">Siste aktivitet</string>
+
+    <string name="accounts_title">Kontoer</string>
+    <string name="accounts_available">Disponibelt</string>
+    <string name="accounts_balance">Saldo</string>
+
+    <string name="payments_new_instant">Ny straksbetaling</string>
+    <string name="payments_new_scheduled">Planlegg betaling</string>
+    <string name="payments_creditor_iban">Mottakers IBAN</string>
+    <string name="payments_creditor_name">Mottakers navn</string>
+    <string name="payments_amount">Beløp</string>
+    <string name="payments_reference">Referanse / KID</string>
+    <string name="payments_from_account">Fra konto</string>
+    <string name="payments_vop_match">Mottaker bekreftet</string>
+    <string name="payments_vop_close">Mottakers navn ligner — kontroller før du fortsetter.</string>
+    <string name="payments_vop_mismatch">Mottakerens navn passer ikke.</string>
+    <string name="payments_vop_unavailable">Kunne ikke verifisere mottaker (offline).</string>
+    <string name="payments_submit_instant">Send straksbetaling</string>
+    <string name="payments_submit_scheduled">Planlegg betaling</string>
+
+    <string name="mandates_title">AvtaleGiro-fullmakter</string>
+    <string name="mandates_new">Ny fullmakt</string>
+    <string name="mandates_amend">Endre</string>
+    <string name="mandates_terminate">Avslutt</string>
+
+    <string name="r2p_title">Betalingsforespørsler</string>
+    <string name="r2p_accept">Godkjenn</string>
+    <string name="r2p_decline">Avslå</string>
+    <string name="r2p_defer">Utsett</string>
+    <string name="r2p_amend">Foreslå endring</string>
+    <string name="r2p_no_requests">Ingen aktive forespørsler</string>
+
+    <string name="beneficiaries_title">Mottakere</string>
+    <string name="beneficiaries_add">Legg til mottaker</string>
+    <string name="beneficiaries_trust">Marker som betrodd</string>
+    <string name="beneficiaries_untrust">Fjern betrodd-status</string>
+
+    <string name="consents_title">Aktive samtykker</string>
+    <string name="consents_revoke">Tilbakekall</string>
+
+    <string name="notifications_title">Varslinger</string>
+    <string name="notifications_mark_all_read">Marker alle som lest</string>
+
+    <string name="profile_title">Profil</string>
+    <string name="profile_language">Språk</string>
+
+    <string name="privacy_title">Personvern og GDPR</string>
+    <string name="privacy_request_export">Be om eksport</string>
+    <string name="privacy_request_erasure">Be om sletting</string>
+
+    <string name="sca_title">Bekreft handlingen</string>
+    <string name="sca_description">Bekreft med BankID for å fullføre.</string>
+    <string name="sca_code_label">6-sifret kode</string>
+    <string name="sca_verify">Verifiser</string>
+
+    <string name="biometric_unlock_title">Lås opp JRPay</string>
+    <string name="biometric_unlock_subtitle">Bruk biometri for å åpne nettbanken.</string>
+    <string name="biometric_unlock_negative">Bruk BankID i stedet</string>
+
+    <string name="common_loading">Laster …</string>
+    <string name="common_cancel">Avbryt</string>
+    <string name="common_confirm">Bekreft</string>
+    <string name="common_save">Lagre</string>
+    <string name="common_retry">Prøv igjen</string>
+    <string name="common_logout">Logg ut</string>
+    <string name="common_delete">Slett</string>
+    <string name="common_edit">Rediger</string>
+    <string name="common_no_results">Ingen treff</string>
+</resources>

@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="theme-color" content="#0d2247">
+    <title>JRPay Admin Console — placeholder</title>
+    <style>
+        :root { color-scheme: light dark; --bg:#0d2247; --fg:#fafafa; --accent:#7fc7ff; }
+        body { background: var(--bg); color: var(--fg); font-family: system-ui, sans-serif;
+               max-width: 720px; margin: 4rem auto; padding: 0 1.5rem; line-height: 1.55; }
+        h1 { color: var(--accent); margin-top: 0; }
+        code { background: rgba(255,255,255,0.08); padding: 0.1em 0.35em; border-radius: 4px; }
+        ul { padding-left: 1.5em; }
+        a { color: var(--accent); }
+        small { opacity: 0.7; }
+    </style>
+</head>
+<body>
+    <h1>JRPay Admin Console</h1>
+    <p>This is a development-time placeholder served by nginx on port <code>5174</code>.
+       The real Admin Web (Phase 3 of the GUI initiative) replaces this static page
+       with a React SPA backed by the Phase-2 admin endpoints.</p>
+    <h2>What's wired today (Phase 2)</h2>
+    <ul>
+        <li><strong>Identity</strong> &mdash; <code>http://identity:8097</code>
+            (OAuth2 Authorization Server, SCA, password reset, privacy notice)</li>
+        <li><strong>A1 Account Ledger admin</strong> &mdash;
+            <code>/api/v1/admin/accounts/*</code> on port <code>8091</code></li>
+        <li><strong>A5 Fraud + Sanctions admin</strong> &mdash;
+            <code>/api/v1/admin/fraud/*</code>, <code>/api/v1/admin/sanctions/*</code>
+            on port <code>8095</code></li>
+        <li><strong>Audit Query</strong> &mdash;
+            <code>/api/v1/admin/audit/*</code> on port <code>8099</code></li>
+    </ul>
+    <p>The OAuth2 callback configured for the future SPA is
+       <code>http://localhost:5174/oauth/callback</code>.</p>
+    <p><small>Built from <code>implementation/docker/admin-web/</code>.</small></p>
+</body>
+</html>

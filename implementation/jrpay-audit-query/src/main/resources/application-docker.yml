@@ -1,0 +1,12 @@
+spring:
+  datasource:
+    url: jdbc:postgresql://postgres:5432/audit
+    username: jrpay
+    password: jrpay
+  kafka:
+    bootstrap-servers: kafka:29092
+
+jrpay:
+  audit:
+    jwt:
+      jwks-uri: http://identity:8097/oauth2/jwks

@@ -1,0 +1,725 @@
+openapi: 3.1.0
+info:
+  title: JRPay — Admin Accounts
+  version: 1.0.0
+  description: |
+    Admin-facing account surface. Realises UC-G35 (search, freeze,
+    unfreeze, close, create) and UC-G36 (PII reveal with audit and
+    auto-remask + extension + rate-limit second-approval).
+
+    Hosted by A1 (new admin controller per Phase 2I). Every mutating
+    action (freeze, unfreeze, close, create, reveal-PII) requires
+    step-up SCA; `Step-Up-Token.dl_hash` must match class `admin-action`
+    with the appropriate `action` value (`DYNAMIC_LINKING.md` §"admin-
+    action" — enum `AdminAction`).
+
+    Scopes:
+      - `accounts:admin:read` — search, detail view, masked rendering,
+        PII reveal of non-fødselsnummer fields.
+      - `accounts:admin:write` — freeze / unfreeze / close / create, and
+        fødselsnummer reveal (Phase 1 FS.10: FRAUD_ANALYST cannot reveal
+        fødselsnummer; COMPLIANCE_OFFICER+ can).
+
+    See `shared-schemas.yaml` for enums + Problem envelope + pagination.
+
+servers:
+  - url: "https://admin-api.{env}.jrpay.example"
+    variables: { env: { default: dev } }
+  - url: "http://localhost:8091"
+    description: Local dev (A1 port)
+
+tags:
+  - name: Admin-Account-Search
+    description: UC-G35 §6.1
+  - name: Admin-Account-Detail
+    description: UC-G35 §6.2
+  - name: Admin-Account-Mutations
+    description: Freeze / unfreeze / close / create (UC-G35 §6.3–§6.6)
+  - name: Admin-Pii-Reveal
+    description: UC-G36 reveal / extend / approve
+
+paths:
+  #############################################################################
+  # Search
+  #############################################################################
+  /api/v1/admin/accounts/search:
+    get:
+      tags: [Admin-Account-Search]
+      summary: Search accounts (UC-G35 §6.1)
+      description: |
+        Three mutually-exclusive `mode` values:
+          - `name` — fuzzy (trigram + prefix) match on holder name. Max 50 results.
+          - `iban` — exact (mod-97 validated).
+          - `fodselsnummer` — exact; requires `acr=loa3-admin` issued in
+            the last 5 minutes. Server enforces step-up if missing with
+            `401 urn:problem:step-up-required`. Every fødselsnummer search
+            is audited regardless of result.
+      operationId: searchAccounts
+      security:
+        - OAuth2Admin: [accounts:admin:read]
+      parameters:
+        - name: mode
+          in: query
+          required: true
+          schema:
+            type: string
+            enum: [name, iban, fodselsnummer]
+        - name: q
+          in: query
+          required: true
+          schema: { type: string, minLength: 2, maxLength: 140 }
+        - $ref: "shared-schemas.yaml#/components/parameters/StepUpToken"
+        - $ref: "shared-schemas.yaml#/components/parameters/PageNumber"
+        - $ref: "shared-schemas.yaml#/components/parameters/PageSize"
+      responses:
+        "200":
+          description: Search results.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, page, truncated]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/AdminAccountSummary" }
+                  page: { $ref: "shared-schemas.yaml#/components/schemas/PageMeta" }
+                  truncated:
+                    type: boolean
+                    description: |
+                      `true` when the server capped results. Client shows
+                      the "refine search" banner (UC-G35 AF-01).
+        "401":
+          description: urn:problem:step-up-required (fodselsnummer mode without step-up).
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+        "403":
+          description: urn:problem:dynamic-linking-mismatch (step-up token for wrong action).
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+        "429": { $ref: "shared-schemas.yaml#/components/responses/Problem429" }
+
+  #############################################################################
+  # Detail
+  #############################################################################
+  /api/v1/admin/accounts/{accountId}:
+    get:
+      tags: [Admin-Account-Detail]
+      summary: Admin account detail (UC-G35 §6.2)
+      description: |
+        Masked holder info + balances + reservations + recent transactions
+        + account-scoped audit subset. Full PII requires UC-G36 reveal.
+      operationId: getAdminAccount
+      security:
+        - OAuth2Admin: [accounts:admin:read]
+      parameters:
+        - $ref: "#/components/parameters/AccountId"
+      responses:
+        "200":
+          description: Account detail.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AdminAccountDetail" }
+        "404": { $ref: "shared-schemas.yaml#/components/responses/Problem404" }
+
+  /api/v1/admin/accounts/{accountId}/transactions:
+    get:
+      tags: [Admin-Account-Detail]
+      summary: Recent account transactions (admin view)
+      operationId: listAdminAccountTransactions
+      security:
+        - OAuth2Admin: [accounts:admin:read]
+      parameters:
+        - $ref: "#/components/parameters/AccountId"
+        - name: from
+          in: query
+          schema: { $ref: "shared-schemas.yaml#/components/schemas/LocalDate" }
+        - name: to
+          in: query
+          schema: { $ref: "shared-schemas.yaml#/components/schemas/LocalDate" }
+        - $ref: "shared-schemas.yaml#/components/parameters/PageNumber"
+        - $ref: "shared-schemas.yaml#/components/parameters/PageSize"
+      responses:
+        "200":
+          description: Transactions.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, page]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/AdminTransactionSummary" }
+                  page: { $ref: "shared-schemas.yaml#/components/schemas/PageMeta" }
+
+  /api/v1/admin/accounts/{accountId}/audit:
+    get:
+      tags: [Admin-Account-Detail]
+      summary: Account-scoped audit subset (UC-G35 §6.2)
+      description: |
+        Events where `accountId` matches. PII is masked per
+        standard; reveals require UC-G36 per-field.
+      operationId: listAdminAccountAudit
+      security:
+        - OAuth2Admin: [accounts:admin:read, audit:read]
+      parameters:
+        - $ref: "#/components/parameters/AccountId"
+        - name: from
+          in: query
+          schema: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        - name: to
+          in: query
+          schema: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        - $ref: "shared-schemas.yaml#/components/parameters/PageNumber"
+        - $ref: "shared-schemas.yaml#/components/parameters/PageSize"
+      responses:
+        "200":
+          description: Audit subset.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, page]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/AdminAuditRow" }
+                  page: { $ref: "shared-schemas.yaml#/components/schemas/PageMeta" }
+
+  #############################################################################
+  # Mutations (UC-G35 §6.3–§6.6)
+  #############################################################################
+  /api/v1/admin/accounts/{accountId}/freeze:
+    post:
+      tags: [Admin-Account-Mutations]
+      summary: Freeze account (UC-G35 §6.3)
+      description: |
+        Step-up SCA required; class `admin-action`, `action=FREEZE_ACCOUNT`,
+        `resourceType=account`, `resourceId=<accountId>`, `notesHash` over
+        NFC-normalised notes. Server publishes `account.freeze-commands`
+        with the chosen `reason` + reference; A1 applies and the UI
+        reflects via the returned state.
+      operationId: freezeAccount
+      security:
+        - OAuth2Admin: [accounts:admin:write]
+      parameters:
+        - $ref: "#/components/parameters/AccountId"
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+        - $ref: "shared-schemas.yaml#/components/parameters/StepUpToken"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/FreezeRequest" }
+      responses:
+        "200":
+          description: Frozen.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AdminAccountDetail" }
+        "401":
+          description: urn:problem:step-up-required
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+        "403":
+          description: urn:problem:dynamic-linking-mismatch
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+        "404": { $ref: "shared-schemas.yaml#/components/responses/Problem404" }
+        "409":
+          description: Account already frozen (idempotent no-op; state echoed back).
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+
+  /api/v1/admin/accounts/{accountId}/unfreeze:
+    post:
+      tags: [Admin-Account-Mutations]
+      summary: Unfreeze account (UC-G35 §6.4 — SUPERVISOR+)
+      description: |
+        Requires SUPERVISOR role server-side (in addition to
+        `accounts:admin:write`). Step-up SCA with
+        `action=UNFREEZE_ACCOUNT`.
+      operationId: unfreezeAccount
+      security:
+        - OAuth2Admin: [accounts:admin:write]
+      parameters:
+        - $ref: "#/components/parameters/AccountId"
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+        - $ref: "shared-schemas.yaml#/components/parameters/StepUpToken"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/UnfreezeRequest" }
+      responses:
+        "200":
+          description: Unfrozen.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AdminAccountDetail" }
+        "403":
+          description: |
+            urn:problem:dynamic-linking-mismatch or role missing
+            (non-SUPERVISOR).
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+
+  /api/v1/admin/accounts/{accountId}/close:
+    post:
+      tags: [Admin-Account-Mutations]
+      summary: Close account (UC-G35 §6.5)
+      description: |
+        Requires zero balance + zero reservations. Step-up SCA with
+        `action=CLOSE_ACCOUNT`.
+      operationId: closeAccount
+      security:
+        - OAuth2Admin: [accounts:admin:write]
+      parameters:
+        - $ref: "#/components/parameters/AccountId"
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+        - $ref: "shared-schemas.yaml#/components/parameters/StepUpToken"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CloseAccountRequest" }
+      responses:
+        "200":
+          description: Closed.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AdminAccountDetail" }
+        "409":
+          description: |
+            `urn:problem:consents-active` (active consents block close) or
+            `urn:problem:pending-execution` (in-flight transaction).
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+        "422":
+          description: urn:problem:account-balance-nonzero
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+
+  /api/v1/admin/accounts:
+    post:
+      tags: [Admin-Account-Mutations]
+      summary: Create account (UC-G35 §6.6)
+      description: |
+        Post-CDD; `customerId` must resolve to an existing customer whose
+        CDD is complete. Step-up SCA with `action=CREATE_ACCOUNT`. An
+        optional internal transfer can be included as `initialDeposit`
+        when the operator is seeding the account from the bank's own
+        operating account.
+      operationId: createAccount
+      security:
+        - OAuth2Admin: [accounts:admin:write]
+      parameters:
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+        - $ref: "shared-schemas.yaml#/components/parameters/StepUpToken"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateAccountRequest" }
+      responses:
+        "201":
+          description: Created.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AdminAccountDetail" }
+        "403":
+          description: urn:problem:dynamic-linking-mismatch
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+        "422":
+          description: CDD not complete, unsupported currency, …
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+
+  #############################################################################
+  # PII reveal (UC-G36)
+  #############################################################################
+  /api/v1/admin/accounts/{accountId}/reveal-pii:
+    post:
+      tags: [Admin-Pii-Reveal]
+      summary: Reveal a PII field (UC-G36 §6)
+      description: |
+        Returns the unmasked value with `ttlSeconds` (default 60). Every
+        reveal is audited with `{operatorId, customerId, accountId, field,
+        revealedAt, justificationNotes}`. Step-up SCA required; class
+        `admin-action`, `action=REVEAL_PII`, `resourceType=account`,
+        `resourceId=<accountId>`, `decision=<field>`.
+
+        Rate limit (FS.10): > 5 reveals / hour / operator / account
+        triggers second-approval mode — server returns `202` with
+        `requiresSecondApproval=true` and an `approvalRef`. A
+        SUPERVISOR releases via `/reveal-pii/approve`. Successful
+        approval returns the value immediately.
+
+        Field scoping:
+          - `holderName`, `address` — `accounts:admin:read` suffices.
+          - `fodselsnummer` — requires `accounts:admin:write`
+            (COMPLIANCE_OFFICER+).
+      operationId: revealPii
+      security:
+        - OAuth2Admin: [accounts:admin:read]
+      parameters:
+        - $ref: "#/components/parameters/AccountId"
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+        - $ref: "shared-schemas.yaml#/components/parameters/StepUpToken"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RevealPiiRequest" }
+      responses:
+        "200":
+          description: Value revealed.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RevealPiiAck" }
+        "202":
+          description: Rate-limited; requires SUPERVISOR approval.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RevealPiiPendingApproval" }
+        "403":
+          description: |
+            `urn:problem:dynamic-linking-mismatch` or field-scope missing
+            (FRAUD_ANALYST attempting fødselsnummer).
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+        "422":
+          description: Justification too short.
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+
+  /api/v1/admin/accounts/{accountId}/reveal-pii/extend:
+    post:
+      tags: [Admin-Pii-Reveal]
+      summary: Extend a live reveal (UC-G36 §6 step 6)
+      description: |
+        Extends the active reveal by another 60 s. Max 3 extensions per
+        initial reveal (total = 4 × 60 s = 4 min). Each extension is
+        audited as `audit.pii-revealed.extended`.
+      operationId: extendPiiReveal
+      security:
+        - OAuth2Admin: [accounts:admin:read]
+      parameters:
+        - $ref: "#/components/parameters/AccountId"
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+        - $ref: "shared-schemas.yaml#/components/parameters/StepUpToken"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RevealPiiExtendRequest" }
+      responses:
+        "200":
+          description: Extended.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ttlSeconds, extensionsRemaining]
+                properties:
+                  ttlSeconds: { type: integer, example: 60 }
+                  extensionsRemaining:
+                    type: integer
+                    minimum: 0
+                    maximum: 3
+        "409":
+          description: No active reveal or extensions exhausted.
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+
+  /api/v1/admin/accounts/{accountId}/reveal-pii/approve:
+    post:
+      tags: [Admin-Pii-Reveal]
+      summary: SUPERVISOR approves a rate-limited reveal (UC-G36 §6 step 7)
+      description: |
+        SUPERVISOR + step-up SCA. On success, server returns the unmasked
+        value (same shape as a direct reveal) and audits both the
+        approval and the reveal itself.
+      operationId: approvePiiReveal
+      security:
+        - OAuth2Admin: [accounts:admin:write]
+      parameters:
+        - $ref: "#/components/parameters/AccountId"
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+        - $ref: "shared-schemas.yaml#/components/parameters/StepUpToken"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [approvalRef]
+              additionalProperties: false
+              properties:
+                approvalRef: { type: string }
+      responses:
+        "200":
+          description: Approved; value returned.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RevealPiiAck" }
+        "403":
+          description: Role missing or DL mismatch.
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+        "404":
+          description: Approval ref unknown or already consumed.
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+
+components:
+  securitySchemes:
+    OAuth2Admin:
+      $ref: "shared-schemas.yaml#/components/securitySchemes/OAuth2Admin"
+
+  parameters:
+    AccountId:
+      name: accountId
+      in: path
+      required: true
+      schema: { type: string }
+
+  schemas:
+    AdminAccountSummary:
+      type: object
+      required: [accountId, ibanMasked, type, currency, status, holderNameMasked]
+      properties:
+        accountId: { type: string }
+        ibanMasked:
+          type: string
+          description: Masked per UC-G35 §12 ("NO93 •••• •••• 7947").
+        type: { $ref: "shared-schemas.yaml#/components/schemas/AccountType" }
+        currency: { $ref: "shared-schemas.yaml#/components/schemas/Currency" }
+        status: { $ref: "shared-schemas.yaml#/components/schemas/AccountStatus" }
+        holderNameMasked:
+          type: string
+          description: |
+            "Ola N*****"-style mask; length proportional to the original
+            (UC-G35 §12).
+        customerId: { type: string }
+        bookedBalance: { $ref: "shared-schemas.yaml#/components/schemas/MonetaryAmount" }
+        availableBalance: { $ref: "shared-schemas.yaml#/components/schemas/MonetaryAmount" }
+        freezeReason:
+          description: Present when `status=FROZEN`.
+          $ref: "shared-schemas.yaml#/components/schemas/FreezeReason"
+
+    AdminAccountDetail:
+      allOf:
+        - $ref: "#/components/schemas/AdminAccountSummary"
+        - type: object
+          properties:
+            iban:
+              description: Full IBAN — returned by `/{id}` only, never in search lists.
+              $ref: "shared-schemas.yaml#/components/schemas/Iban"
+            bic: { $ref: "shared-schemas.yaml#/components/schemas/Bic" }
+            reservedAmount: { $ref: "shared-schemas.yaml#/components/schemas/MonetaryAmount" }
+            reservations:
+              type: array
+              items:
+                type: object
+                required: [paymentId, amount, currency, createdAt]
+                properties:
+                  paymentId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+                  amount: { $ref: "shared-schemas.yaml#/components/schemas/MonetaryAmount" }
+                  currency: { $ref: "shared-schemas.yaml#/components/schemas/Currency" }
+                  createdAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+            openedAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+            closedAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+            freezeDetail:
+              description: Present when `status=FROZEN`.
+              type: object
+              properties:
+                reason: { $ref: "shared-schemas.yaml#/components/schemas/FreezeReason" }
+                reference: { type: string }
+                appliedAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+                appliedBy: { type: string }
+                notesSummary: { type: string, maxLength: 140 }
+            holderAddressMasked: { type: string }
+            fodselsnummerMasked: { type: string }
+
+    AdminTransactionSummary:
+      type: object
+      required: [transactionId, postedAt, amount, currency, status, direction]
+      properties:
+        transactionId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+        postedAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        direction:
+          type: string
+          enum: [DEBIT, CREDIT]
+        amount: { $ref: "shared-schemas.yaml#/components/schemas/MonetaryAmount" }
+        currency: { $ref: "shared-schemas.yaml#/components/schemas/Currency" }
+        status: { $ref: "shared-schemas.yaml#/components/schemas/PaymentStatus" }
+        counterpartyNameMasked: { type: string }
+        counterpartyIbanMasked: { type: string }
+        reference: { type: string }
+        rejectionReason: { $ref: "shared-schemas.yaml#/components/schemas/InternalRejectionReason" }
+
+    AdminAuditRow:
+      type: object
+      required: [eventId, at, type, actor, outcome]
+      properties:
+        eventId: { $ref: "shared-schemas.yaml#/components/schemas/Ulid" }
+        at: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        type: { type: string }
+        actor: { type: string }
+        outcome:
+          type: string
+          enum: [SUCCESS, FAILURE, REJECTED]
+        severity: { $ref: "shared-schemas.yaml#/components/schemas/AuditSeverity" }
+        summary: { type: string, maxLength: 280 }
+        resourceType:
+          type: string
+          enum: [case, hit, account, payment, audit, gdpr-request, user, banner]
+        resourceId: { type: string }
+
+    FreezeRequest:
+      type: object
+      required: [reason, notes, confirmedCriteria]
+      additionalProperties: false
+      properties:
+        reason: { $ref: "shared-schemas.yaml#/components/schemas/FreezeReason" }
+        notes:
+          type: string
+          minLength: 50
+          maxLength: 2000
+        confirmedCriteria: { type: boolean }
+        freezeReference:
+          type: string
+          description: Optional external reference (e.g. regulator case id).
+
+    UnfreezeRequest:
+      type: object
+      required: [reason, notes, confirmedCriteria]
+      additionalProperties: false
+      properties:
+        reason: { $ref: "shared-schemas.yaml#/components/schemas/UnfreezeReason" }
+        notes:
+          type: string
+          minLength: 50
+          maxLength: 2000
+        confirmedCriteria: { type: boolean }
+
+    CloseAccountRequest:
+      type: object
+      required: [reason, notes, confirmedCriteria]
+      additionalProperties: false
+      properties:
+        reason:
+          type: string
+          enum:
+            - CUSTOMER_REQUEST
+            - GDPR_ERASURE
+            - OPERATIONAL_CLEANUP
+            - REGULATORY
+            - OTHER
+        notes:
+          type: string
+          minLength: 50
+          maxLength: 2000
+        confirmedCriteria: { type: boolean }
+
+    CreateAccountRequest:
+      type: object
+      required: [customerId, type, currency, notes, confirmedCriteria]
+      additionalProperties: false
+      properties:
+        customerId: { type: string }
+        type: { $ref: "shared-schemas.yaml#/components/schemas/AccountType" }
+        currency: { $ref: "shared-schemas.yaml#/components/schemas/Currency" }
+        nickname:
+          type: string
+          maxLength: 140
+        initialDeposit:
+          description: Optional internal transfer from the bank's operating account.
+          type: object
+          required: [amount, sourceAccountId]
+          properties:
+            amount: { $ref: "shared-schemas.yaml#/components/schemas/MonetaryAmount" }
+            sourceAccountId: { type: string }
+            reference:
+              type: string
+              maxLength: 140
+        notes:
+          type: string
+          minLength: 50
+          maxLength: 2000
+        confirmedCriteria: { type: boolean }
+
+    RevealPiiRequest:
+      type: object
+      required: [field, justificationNotes, confirmedBusinessNeed]
+      additionalProperties: false
+      properties:
+        field:
+          type: string
+          enum: [holderName, address, fodselsnummer]
+        justificationNotes:
+          type: string
+          minLength: 20
+          maxLength: 2000
+        confirmedBusinessNeed:
+          type: boolean
+          description: Mandatory checkbox value — must be `true`.
+
+    RevealPiiAck:
+      type: object
+      required: [field, value, ttlSeconds, extensionsRemaining, revealedAt]
+      properties:
+        field:
+          type: string
+          enum: [holderName, address, fodselsnummer]
+        value: { type: string }
+        ttlSeconds: { type: integer, example: 60 }
+        extensionsRemaining:
+          type: integer
+          minimum: 0
+          maximum: 3
+        revealedAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        revealId:
+          description: Stable id used by `/extend`.
+          $ref: "shared-schemas.yaml#/components/schemas/Uuid"
+        auditEventId:
+          $ref: "shared-schemas.yaml#/components/schemas/Ulid"
+
+    RevealPiiPendingApproval:
+      type: object
+      required: [requiresSecondApproval, approvalRef, expiresAt]
+      properties:
+        requiresSecondApproval:
+          type: boolean
+          description: Always `true` when this shape is returned.
+        approvalRef: { type: string }
+        expiresAt:
+          description: When the approval request expires (default 15 min).
+          $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant"
+        rateLimitWindowResetAt:
+          $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant"
+
+    RevealPiiExtendRequest:
+      type: object
+      required: [revealId]
+      additionalProperties: false
+      properties:
+        revealId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }

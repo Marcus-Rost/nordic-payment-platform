@@ -1,0 +1,16 @@
+# A6 (VoP) is in-memory + stateless. The customer-facing path is internal —
+# A4 calls it on the docker network; no external port mapping needed.
+spring:
+  kafka:
+    bootstrap-servers: kafka:29092
+
+# A1 lives at hostname `account-ledger` in the compose network. The default
+# `localhost:8091` only works for a co-located dev box; inside the VoP
+# container `localhost` resolves to VoP itself, breaking the cache-miss
+# fallback to A1's holder-name endpoint. Caught during the 2026-04-27
+# E2E run where MasterUC01SmokeTest's positive-VoP assertion failed
+# with NOT_FOUND because the A1 RestClient could not connect.
+jrpay:
+  vop:
+    a1-client:
+      base-url: http://account-ledger:8091

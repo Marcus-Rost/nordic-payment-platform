@@ -1,0 +1,84 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">JRPay</string>
+    <string name="login_title">Sign in</string>
+    <string name="login_subtitle">Sign in with BankID to open online banking.</string>
+    <string name="login_continue_with_bankid">Continue with BankID</string>
+    <string name="login_sca_notice">Money transfers require BankID confirmation.</string>
+
+    <string name="nav_dashboard">Dashboard</string>
+    <string name="nav_payments">Payments</string>
+    <string name="nav_r2p">Requests</string>
+    <string name="nav_more">More</string>
+
+    <string name="dashboard_title">Welcome back</string>
+    <string name="dashboard_total_balance">Total balance</string>
+    <string name="dashboard_recent_activity">Recent activity</string>
+
+    <string name="accounts_title">Accounts</string>
+    <string name="accounts_available">Available</string>
+    <string name="accounts_balance">Balance</string>
+
+    <string name="payments_new_instant">New instant payment</string>
+    <string name="payments_new_scheduled">Schedule payment</string>
+    <string name="payments_creditor_iban">Creditor IBAN</string>
+    <string name="payments_creditor_name">Creditor name</string>
+    <string name="payments_amount">Amount</string>
+    <string name="payments_reference">Reference / KID</string>
+    <string name="payments_from_account">From account</string>
+    <string name="payments_vop_match">Payee verified</string>
+    <string name="payments_vop_close">Payee name is similar — verify before continuing.</string>
+    <string name="payments_vop_mismatch">Payee name does not match.</string>
+    <string name="payments_vop_unavailable">Could not verify payee (offline).</string>
+    <string name="payments_submit_instant">Send instant payment</string>
+    <string name="payments_submit_scheduled">Schedule payment</string>
+
+    <string name="mandates_title">AvtaleGiro mandates</string>
+    <string name="mandates_new">New mandate</string>
+    <string name="mandates_amend">Amend</string>
+    <string name="mandates_terminate">Terminate</string>
+
+    <string name="r2p_title">Payment requests</string>
+    <string name="r2p_accept">Accept</string>
+    <string name="r2p_decline">Decline</string>
+    <string name="r2p_defer">Defer</string>
+    <string name="r2p_amend">Propose amendment</string>
+    <string name="r2p_no_requests">No active requests</string>
+
+    <string name="beneficiaries_title">Beneficiaries</string>
+    <string name="beneficiaries_add">Add beneficiary</string>
+    <string name="beneficiaries_trust">Mark as trusted</string>
+    <string name="beneficiaries_untrust">Remove trust</string>
+
+    <string name="consents_title">Active consents</string>
+    <string name="consents_revoke">Revoke</string>
+
+    <string name="notifications_title">Notifications</string>
+    <string name="notifications_mark_all_read">Mark all as read</string>
+
+    <string name="profile_title">Profile</string>
+    <string name="profile_language">Language</string>
+
+    <string name="privacy_title">Privacy &amp; GDPR</string>
+    <string name="privacy_request_export">Request export</string>
+    <string name="privacy_request_erasure">Request erasure</string>
+
+    <string name="sca_title">Confirm action</string>
+    <string name="sca_description">Confirm with BankID to complete.</string>
+    <string name="sca_code_label">6-digit code</string>
+    <string name="sca_verify">Verify</string>
+
+    <string name="biometric_unlock_title">Unlock JRPay</string>
+    <string name="biometric_unlock_subtitle">Use biometrics to access your accounts.</string>
+    <string name="biometric_unlock_negative">Use BankID instead</string>
+
+    <string name="common_loading">Loading…</string>
+    <string name="common_cancel">Cancel</string>
+    <string name="common_confirm">Confirm</string>
+    <string name="common_save">Save</string>
+    <string name="common_retry">Retry</string>
+    <string name="common_logout">Logout</string>
+    <string name="common_delete">Delete</string>
+    <string name="common_edit">Edit</string>
+    <string name="common_no_results">No results</string>
+</resources>

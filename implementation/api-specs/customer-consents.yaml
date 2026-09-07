@@ -1,0 +1,629 @@
+openapi: 3.1.0
+info:
+  title: JRPay — Customer Consents (PSD2 + VRP)
+  version: 1.0.0
+  description: |
+    Customer-facing consent management: PSD2 AIS / PIS / CBPII consents
+    granted to TPPs (UC-G17 — redirect + approve; UC-G18 — view + revoke)
+    and VRP (Variable Recurring Payment) consents for directly authorised
+    recurring debits (UC-G10).
+
+    This spec focuses on the *customer's* surface. The TPP-initiated OAuth2
+    authorisation entry point (`GET /oauth2/authorize`) lives in
+    `identity.yaml`; this spec holds the consent record CRUD + VRP setup.
+
+    Dynamic-linking classes (`gui/architecture/DYNAMIC_LINKING.md`):
+      - `psd2-consent` for AIS/PIS/CBPII grants
+      - `vrp-consent` for VRP grants
+
+    Revocation (UC-G18) does **not** require SCA (PSD2 Art. 57 /
+    Art. 67 §4 allows revocation without friction).
+
+    See `shared-schemas.yaml` for enums + Problem envelope + pagination.
+
+servers:
+  - url: "https://api.{env}.jrpay.example"
+    variables: { env: { default: dev } }
+  - url: "http://localhost:8094"
+    description: Local dev
+
+tags:
+  - name: Consents
+    description: List / detail / revoke across PSD2 + VRP (UC-G18)
+  - name: PSD2-Consents
+    description: PSD2 consent surface used during TPP redirect (UC-G17 server-side)
+  - name: VRP-Consents
+    description: VRP self-service creation and retrieval (UC-G10 §6.1)
+
+paths:
+  #############################################################################
+  # Unified list (UC-G18 §6.1)
+  #############################################################################
+  /api/v1/customer/consents:
+    get:
+      tags: [Consents]
+      summary: List active / expired / revoked consents (UC-G18 §6.1)
+      description: |
+        Unified list across PSD2 (AIS/PIS/CBPII) and VRP consents. Each
+        item carries a `kind` discriminator so the UI can render the
+        appropriate row layout per UC-G18 (grouped by TPP for PSD2,
+        grouped by payee for VRP).
+      operationId: listConsents
+      security:
+        - OAuth2Customer: [consents:manage]
+      parameters:
+        - name: status
+          in: query
+          description: Filter by one or more consent statuses. Default `ACTIVE`.
+          schema:
+            type: array
+            items: { $ref: "shared-schemas.yaml#/components/schemas/ConsentStatus" }
+          style: form
+          explode: true
+        - name: kind
+          in: query
+          schema:
+            type: array
+            items:
+              type: string
+              enum: [PSD2, VRP]
+          style: form
+          explode: true
+        - name: tppQuery
+          in: query
+          description: Substring on TPP display name (PSD2 only).
+          schema: { type: string }
+        - $ref: "shared-schemas.yaml#/components/parameters/PageNumber"
+        - $ref: "shared-schemas.yaml#/components/parameters/PageSize"
+      responses:
+        "200":
+          description: Paginated consent list.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, page]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/ConsentSummary" }
+                  page: { $ref: "shared-schemas.yaml#/components/schemas/PageMeta" }
+
+  /api/v1/customer/consents/{consentId}:
+    get:
+      tags: [Consents]
+      summary: Consent detail with activity log (UC-G18 §6.2)
+      operationId: getConsent
+      security:
+        - OAuth2Customer: [consents:manage]
+      parameters:
+        - $ref: "#/components/parameters/ConsentId"
+      responses:
+        "200":
+          description: Consent detail (PSD2 or VRP shape).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ConsentDetail" }
+        "404": { $ref: "shared-schemas.yaml#/components/responses/Problem404" }
+    delete:
+      tags: [Consents]
+      summary: Revoke a consent (UC-G18 §6.3)
+      description: |
+        Revokes the consent immediately and cascades:
+        - Identity service removes the related refresh tokens from the
+          active table; introspection returns `active=false`.
+        - A3 rejects pending VRP drawdowns against this consent.
+        - PSD2 consent-status Kafka topic publishes `consent.revoked`.
+
+        No SCA — PSD2 mandates frictionless revocation. Returns `409` if a
+        related operation is in-flight (e.g., PIS payment in `PENDING_SCA`
+        — UC-G18 AF-02); the dialog re-prompts the customer to confirm
+        cascade-abort, and a re-sent `DELETE` with `confirmCascadeAbort=true`
+        (query parameter) proceeds.
+      operationId: revokeConsent
+      security:
+        - OAuth2Customer: [consents:manage]
+      parameters:
+        - $ref: "#/components/parameters/ConsentId"
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+        - name: confirmCascadeAbort
+          in: query
+          required: false
+          schema: { type: boolean, default: false }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ConsentRevokeRequest" }
+      responses:
+        "200":
+          description: Consent revoked.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ConsentDetail" }
+        "404": { $ref: "shared-schemas.yaml#/components/responses/Problem404" }
+        "409":
+          description: |
+            `urn:problem:pending-execution` — an in-flight operation
+            requires explicit cascade-abort confirmation.
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+
+  /api/v1/customer/consents/{consentId}/activity:
+    get:
+      tags: [Consents]
+      summary: Consent activity log (UC-G18 §6.2)
+      description: |
+        Audit-projection view of this consent's usage. Rows are drawn from
+        `audit.events` filtered by `consentId`; PII is masked identically to
+        the main audit surface (UC-G35 §12).
+      operationId: listConsentActivity
+      security:
+        - OAuth2Customer: [consents:manage]
+      parameters:
+        - $ref: "#/components/parameters/ConsentId"
+        - $ref: "shared-schemas.yaml#/components/parameters/PageNumber"
+        - $ref: "shared-schemas.yaml#/components/parameters/PageSize"
+        - name: from
+          in: query
+          schema: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        - name: to
+          in: query
+          schema: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+      responses:
+        "200":
+          description: Paginated activity rows.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, page]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/ConsentActivity" }
+                  page: { $ref: "shared-schemas.yaml#/components/schemas/PageMeta" }
+
+  #############################################################################
+  # PSD2 consent surface (UC-G17)
+  #############################################################################
+  /api/v1/customer/consents/psd2/{consentId}:
+    get:
+      tags: [PSD2-Consents]
+      summary: PSD2 consent detail (strong-typed variant)
+      description: |
+        Returns the PSD2 consent variant's fully typed payload. Provided
+        separately from `/consents/{id}` so clients can opt to deserialise
+        against the discriminator-less concrete schema when they know the
+        consent is PSD2 (e.g., after a UC-G17 redirect).
+      operationId: getPsd2Consent
+      security:
+        - OAuth2Customer: [consents:manage]
+      parameters:
+        - $ref: "#/components/parameters/ConsentId"
+      responses:
+        "200":
+          description: PSD2 consent detail.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Psd2ConsentDetail" }
+        "404": { $ref: "shared-schemas.yaml#/components/responses/Problem404" }
+
+  #############################################################################
+  # VRP consent surface (UC-G10)
+  #############################################################################
+  /api/v1/customer/consents/vrp:
+    get:
+      tags: [VRP-Consents]
+      summary: List the customer's VRP consents
+      operationId: listVrpConsents
+      security:
+        - OAuth2Customer: [consents:manage]
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: array
+            items: { $ref: "shared-schemas.yaml#/components/schemas/ConsentStatus" }
+          style: form
+          explode: true
+        - $ref: "shared-schemas.yaml#/components/parameters/PageNumber"
+        - $ref: "shared-schemas.yaml#/components/parameters/PageSize"
+      responses:
+        "200":
+          description: Paginated VRP consents.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, page]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/VrpConsentDetail" }
+                  page: { $ref: "shared-schemas.yaml#/components/schemas/PageMeta" }
+    post:
+      tags: [VRP-Consents]
+      summary: Create a VRP consent self-service (UC-G10 §6.1)
+      description: |
+        Customer-initiated VRP creation (no TPP). Returns a `PENDING_SCA`
+        consent and SCA session metadata bound to `{consentId, payee,
+        payeeIban, perPaymentMax, cumulativeCap, currency, periodType,
+        frequencyMax, validUntil}` (class `vrp-consent`).
+
+        Inline validations:
+        - `cumulativeCap >= perPaymentMax` (UC-G10 AF-03).
+        - `validUntil ≤ now + 24 months` (UC-G10 AF-04 policy cap).
+        - `frequencyMax >= 1`.
+      operationId: createVrpConsent
+      security:
+        - OAuth2Customer: [consents:manage, payments:initiate]
+      parameters:
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/VrpConsentCreateRequest" }
+      responses:
+        "201":
+          description: VRP consent created; pending SCA.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/VrpConsentPendingSca" }
+        "400": { $ref: "shared-schemas.yaml#/components/responses/Problem400" }
+        "409":
+          description: urn:problem:duplicate-consent
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+        "422": { $ref: "shared-schemas.yaml#/components/responses/Problem422" }
+
+  /api/v1/customer/consents/vrp/{consentId}:
+    get:
+      tags: [VRP-Consents]
+      summary: VRP consent detail
+      operationId: getVrpConsent
+      security:
+        - OAuth2Customer: [consents:manage]
+      parameters:
+        - $ref: "#/components/parameters/ConsentId"
+      responses:
+        "200":
+          description: VRP consent detail.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/VrpConsentDetail" }
+        "404": { $ref: "shared-schemas.yaml#/components/responses/Problem404" }
+
+components:
+  securitySchemes:
+    OAuth2Customer:
+      $ref: "shared-schemas.yaml#/components/securitySchemes/OAuth2Customer"
+
+  parameters:
+    ConsentId:
+      name: consentId
+      in: path
+      required: true
+      schema: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+
+  schemas:
+    #########################################################################
+    # Common summary (polymorphic list view)
+    #########################################################################
+    ConsentKind:
+      type: string
+      description: Discriminator for `ConsentSummary` / `ConsentDetail`.
+      enum: [PSD2, VRP]
+
+    # oneOf polymorphism (matches the ConsentDetail pattern below).
+    # Structurally equivalent to allOf + discriminator but avoids a known
+    # openapi-generator quirk where inherited `status`/`kind` references
+    # are emitted as nested-class tokens instead of resolving the $ref.
+    ConsentSummary:
+      oneOf:
+        - $ref: "#/components/schemas/ConsentSummaryPsd2"
+        - $ref: "#/components/schemas/ConsentSummaryVrp"
+      discriminator:
+        propertyName: kind
+        mapping:
+          PSD2: "#/components/schemas/ConsentSummaryPsd2"
+          VRP: "#/components/schemas/ConsentSummaryVrp"
+
+    ConsentSummaryPsd2:
+      type: object
+      required:
+        - consentId
+        - kind
+        - status
+        - createdAt
+        - tppId
+        - tppDisplayName
+        - role
+        - scopes
+        - accountIds
+      properties:
+        consentId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+        kind:
+          type: string
+          enum: [PSD2]
+        status: { $ref: "shared-schemas.yaml#/components/schemas/ConsentStatus" }
+        createdAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        validUntil: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        revokedAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        tppId: { type: string }
+        tppDisplayName: { $ref: "shared-schemas.yaml#/components/schemas/Name" }
+        tppLogoUrl: { type: string, format: uri }
+        tppVerified:
+          type: boolean
+          description: |
+            `true` when the TPP's eIDAS QWAC validated at consent
+            issuance. `false` is only possible for legacy records.
+        role: { $ref: "shared-schemas.yaml#/components/schemas/PsdConsentRole" }
+        scopes:
+          type: array
+          items: { type: string }
+        accountIds:
+          type: array
+          items: { type: string }
+        usageCount30d:
+          type: integer
+          minimum: 0
+
+    ConsentSummaryVrp:
+      type: object
+      required:
+        - consentId
+        - kind
+        - status
+        - createdAt
+        - payee
+        - payeeIban
+        - perPaymentMax
+        - cumulativeCap
+        - currency
+        - periodType
+        - frequencyMax
+      properties:
+        consentId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+        kind:
+          type: string
+          enum: [VRP]
+        status: { $ref: "shared-schemas.yaml#/components/schemas/ConsentStatus" }
+        createdAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        validUntil: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        revokedAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        payee: { $ref: "shared-schemas.yaml#/components/schemas/Name" }
+        payeeIban: { $ref: "shared-schemas.yaml#/components/schemas/Iban" }
+        perPaymentMax: { $ref: "shared-schemas.yaml#/components/schemas/MonetaryAmount" }
+        cumulativeCap: { $ref: "shared-schemas.yaml#/components/schemas/MonetaryAmount" }
+        cumulativeUsed:
+          description: Total spent so far in the current period.
+          $ref: "shared-schemas.yaml#/components/schemas/MonetaryAmount"
+        currency: { $ref: "shared-schemas.yaml#/components/schemas/Currency" }
+        periodType:
+          type: string
+          enum: [DAILY, WEEKLY, MONTHLY, QUARTERLY]
+        frequencyMax:
+          type: integer
+          minimum: 1
+        frequencyUsed:
+          type: integer
+          minimum: 0
+
+    #########################################################################
+    # Detail (polymorphic)
+    #########################################################################
+    ConsentDetail:
+      oneOf:
+        - $ref: "#/components/schemas/Psd2ConsentDetail"
+        - $ref: "#/components/schemas/VrpConsentDetail"
+      discriminator:
+        propertyName: kind
+        mapping:
+          PSD2: "#/components/schemas/Psd2ConsentDetail"
+          VRP: "#/components/schemas/VrpConsentDetail"
+
+    Psd2ConsentDetail:
+      type: object
+      required:
+        - consentId
+        - kind
+        - status
+        - tppId
+        - tppDisplayName
+        - role
+        - scopes
+        - accountIds
+        - validFrom
+        - validUntil
+        - createdAt
+      properties:
+        consentId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+        kind:
+          type: string
+          enum: [PSD2]
+        status: { $ref: "shared-schemas.yaml#/components/schemas/ConsentStatus" }
+        tppId: { type: string }
+        tppDisplayName: { $ref: "shared-schemas.yaml#/components/schemas/Name" }
+        tppLegalName: { $ref: "shared-schemas.yaml#/components/schemas/Name" }
+        tppLogoUrl: { type: string, format: uri }
+        tppVerified: { type: boolean }
+        role: { $ref: "shared-schemas.yaml#/components/schemas/PsdConsentRole" }
+        scopes:
+          type: array
+          items: { type: string }
+          description: Sorted lexicographically per DYNAMIC_LINKING.md rule 7.
+        accountIds:
+          type: array
+          items: { type: string }
+          description: Sorted lexicographically.
+        validFrom: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        validUntil: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        createdAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        revokedAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        revokeReason:
+          $ref: "shared-schemas.yaml#/components/schemas/ConsentRevokeReason"
+        renewalAvailable:
+          type: boolean
+          description: |
+            `true` when this consent is within 7 days of expiry and the
+            role supports renewal (UC-G18 AF-04). Renewal is TPP-initiated
+            by the customer redirecting back through UC-G17.
+
+    VrpConsentDetail:
+      type: object
+      required:
+        - consentId
+        - kind
+        - status
+        - payee
+        - payeeIban
+        - perPaymentMax
+        - cumulativeCap
+        - currency
+        - periodType
+        - frequencyMax
+        - validFrom
+        - validUntil
+        - createdAt
+      properties:
+        consentId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+        kind:
+          type: string
+          enum: [VRP]
+        status: { $ref: "shared-schemas.yaml#/components/schemas/ConsentStatus" }
+        payee: { $ref: "shared-schemas.yaml#/components/schemas/Name" }
+        payeeIban: { $ref: "shared-schemas.yaml#/components/schemas/Iban" }
+        perPaymentMax: { $ref: "shared-schemas.yaml#/components/schemas/MonetaryAmount" }
+        cumulativeCap: { $ref: "shared-schemas.yaml#/components/schemas/MonetaryAmount" }
+        cumulativeUsed: { $ref: "shared-schemas.yaml#/components/schemas/MonetaryAmount" }
+        currency: { $ref: "shared-schemas.yaml#/components/schemas/Currency" }
+        periodType:
+          type: string
+          enum: [DAILY, WEEKLY, MONTHLY, QUARTERLY]
+        frequencyMax:
+          type: integer
+          minimum: 1
+        frequencyUsed:
+          type: integer
+          minimum: 0
+        purpose:
+          type: string
+          maxLength: 140
+          description: Customer-provided purpose, included in each drawdown reference.
+        debtorAccountId:
+          type: string
+          description: Account to debit. Set at creation; immutable.
+        validFrom: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        validUntil: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        createdAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        revokedAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        revokeReason:
+          $ref: "shared-schemas.yaml#/components/schemas/ConsentRevokeReason"
+
+    #########################################################################
+    # Requests
+    #########################################################################
+    ConsentRevokeRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        reason: { $ref: "shared-schemas.yaml#/components/schemas/ConsentRevokeReason" }
+        note:
+          type: string
+          maxLength: 280
+          description: Optional private note (not exposed to TPP).
+
+    VrpConsentCreateRequest:
+      type: object
+      required:
+        - payee
+        - payeeIban
+        - perPaymentMax
+        - cumulativeCap
+        - currency
+        - periodType
+        - frequencyMax
+        - validUntil
+        - debtorAccountId
+      additionalProperties: false
+      properties:
+        payee: { $ref: "shared-schemas.yaml#/components/schemas/Name" }
+        payeeIban: { $ref: "shared-schemas.yaml#/components/schemas/Iban" }
+        perPaymentMax: { $ref: "shared-schemas.yaml#/components/schemas/MonetaryAmount" }
+        cumulativeCap: { $ref: "shared-schemas.yaml#/components/schemas/MonetaryAmount" }
+        currency: { $ref: "shared-schemas.yaml#/components/schemas/Currency" }
+        periodType:
+          type: string
+          enum: [DAILY, WEEKLY, MONTHLY, QUARTERLY]
+        frequencyMax:
+          type: integer
+          minimum: 1
+        validFrom:
+          $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant"
+        validUntil: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        debtorAccountId: { type: string }
+        purpose: { type: string, maxLength: 140 }
+        vopResult:
+          description: |
+            Client-observed VoP result for the payee IBAN + name. Server
+            re-runs at submission; this value supports audit of NO_MATCH
+            overrides.
+          $ref: "shared-schemas.yaml#/components/schemas/VoPResult"
+        vopPayerOverride:
+          type: boolean
+
+    VrpConsentPendingSca:
+      type: object
+      required: [consentId, scaSessionId, dl_hash]
+      properties:
+        consentId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+        scaSessionId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+        dl_hash:
+          type: string
+          description: SCA dynamic-linking hash (class `vrp-consent`).
+          pattern: "^[0-9a-f]{64}$"
+        exempt: { type: boolean }
+        stepUpToken: { type: string }
+        challenge:
+          type: object
+          additionalProperties: true
+
+    #########################################################################
+    # Activity log
+    #########################################################################
+    ConsentActivity:
+      type: object
+      required: [eventId, timestamp, action]
+      properties:
+        eventId: { $ref: "shared-schemas.yaml#/components/schemas/Ulid" }
+        timestamp: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        action:
+          type: string
+          enum:
+            - ACCOUNTS_READ
+            - TRANSACTIONS_READ
+            - PAYMENT_INITIATED
+            - PAYMENT_SETTLED
+            - PAYMENT_REJECTED
+            - CONFIRMATION_OF_FUNDS_CHECKED
+            - CONSENT_USED
+            - CONSENT_EXPIRED
+            - CONSENT_REVOKED
+        actor:
+          type: string
+          enum: [CUSTOMER, TPP, SYSTEM]
+        summary:
+          type: string
+          description: |
+            Human-readable, localised via the requesting `Accept-Language`.
+            Rendered directly in UC-G18 §6.2 activity log.
+          maxLength: 280
+        paymentId:
+          description: Present for payment-initiated / settled / rejected events.
+          $ref: "shared-schemas.yaml#/components/schemas/Uuid"
+        amount: { $ref: "shared-schemas.yaml#/components/schemas/MonetaryAmount" }
+        currency: { $ref: "shared-schemas.yaml#/components/schemas/Currency" }

@@ -1,0 +1,58 @@
+spring:
+  application:
+    name: jrpay-identity-service
+
+  datasource:
+    url: jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5432}/identity
+    username: ${DB_USER:jrpay}
+    password: ${DB_PASSWORD:jrpay}
+    hikari:
+      maximum-pool-size: 10
+      minimum-idle: 5
+      connection-timeout: 5000
+
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    open-in-view: false
+    properties:
+      hibernate.jdbc.time_zone: UTC
+
+  flyway:
+    enabled: true
+
+server:
+  port: 8097
+
+management:
+  server:
+    port: 9097
+  endpoints:
+    web:
+      exposure:
+        include: health,readiness,prometheus
+
+jrpay:
+  identity:
+    issuer: ${IDENTITY_ISSUER:http://localhost:8097}
+    jwt:
+      access-token-ttl: PT15M
+      refresh-token-ttl: P14D
+      step-up-token-ttl: PT5M
+    sca:
+      max-attempts: 3
+      session-ttl: PT5M
+      step-up-freshness: PT5M
+    password-reset:
+      token-ttl: PT30M
+      rate-limit-per-hour: 3
+    password-policy:
+      min-length: 10
+      max-length: 128
+      require-mixed-case: true
+      require-digit: true
+      require-symbol: false
+    privacy-notice:
+      current-version: "v1"
+      published-at: "2026-04-24T00:00:00Z"
+      material-change: false

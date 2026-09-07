@@ -1,0 +1,7 @@
+spring:
+  datasource:
+    url: jdbc:postgresql://postgres:5432/clearing
+    username: jrpay
+    password: jrpay
+  kafka:
+    bootstrap-servers: kafka:29092

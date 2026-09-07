@@ -1,0 +1,12 @@
+package com.jrpay.billpay.customer.r2p.dto;
+
+import com.fasterxml.jackson.annotation.JsonInclude;
+import java.time.Instant;
+
+@JsonInclude(JsonInclude.Include.NON_NULL)
+public record R2pDeferAck(
+        String requestId,
+        String scheduledPaymentId,
+        Instant executeAt,
+        String status
+) {}

@@ -1,0 +1,77 @@
+# Generic Spring Boot service Dockerfile.
+#
+# Two-stage build:
+#   1. builder — runs `./gradle :<MODULE>:bootJar` against the multi-module
+#      Gradle project. Layered JAR is produced.
+#   2. runtime — eclipse-temurin:21-jre-alpine. The fat JAR is exploded
+#      so that Spring Boot's layered classpath caches well across rebuilds.
+#
+# Usage from docker-compose:
+#   build:
+#     context: ../
+#     dockerfile: docker/Dockerfile.service
+#     args:
+#       MODULE: jrpay-account-ledger
+#
+# `context: ../` is the implementation/ directory so the build sees all
+# modules + settings.gradle.kts. `MODULE` selects the module to build.
+
+# ---- Builder ----------------------------------------------------------------
+FROM gradle:8.12-jdk21-alpine AS builder
+WORKDIR /workspace
+
+# Cache dependencies layer: copy build files first.
+COPY settings.gradle.kts build.gradle.kts ./
+COPY jrpay-domain-model/build.gradle.kts jrpay-domain-model/
+COPY jrpay-security-starter/build.gradle.kts jrpay-security-starter/
+COPY jrpay-security-starter-kafka/build.gradle.kts jrpay-security-starter-kafka/
+COPY jrpay-account-ledger/build.gradle.kts jrpay-account-ledger/
+COPY jrpay-vop-service/build.gradle.kts jrpay-vop-service/
+COPY jrpay-fraud-detection/build.gradle.kts jrpay-fraud-detection/
+COPY jrpay-clearing-engine/build.gradle.kts jrpay-clearing-engine/
+COPY jrpay-bill-payment/build.gradle.kts jrpay-bill-payment/
+COPY jrpay-psd2-api/build.gradle.kts jrpay-psd2-api/
+COPY jrpay-identity-service/build.gradle.kts jrpay-identity-service/
+COPY jrpay-notifications/build.gradle.kts jrpay-notifications/
+COPY jrpay-audit-query/build.gradle.kts jrpay-audit-query/
+COPY jrpay-smoke-tests/build.gradle.kts jrpay-smoke-tests/
+
+# Pull dependencies once.
+RUN gradle --no-daemon dependencies -q || true
+
+# Now copy sources.
+COPY jrpay-domain-model/src jrpay-domain-model/src
+COPY jrpay-security-starter/src jrpay-security-starter/src
+COPY jrpay-account-ledger/src jrpay-account-ledger/src
+COPY jrpay-vop-service/src jrpay-vop-service/src
+COPY jrpay-fraud-detection/src jrpay-fraud-detection/src
+COPY jrpay-clearing-engine/src jrpay-clearing-engine/src
+COPY jrpay-bill-payment/src jrpay-bill-payment/src
+COPY jrpay-psd2-api/src jrpay-psd2-api/src
+COPY jrpay-identity-service/src jrpay-identity-service/src
+COPY jrpay-notifications/src jrpay-notifications/src
+COPY jrpay-audit-query/src jrpay-audit-query/src
+
+ARG MODULE
+RUN test -n "$MODULE" || (echo "MODULE build-arg required" && exit 1)
+RUN gradle --no-daemon :${MODULE}:bootJar -x test
+
+# ---- Runtime ----------------------------------------------------------------
+FROM eclipse-temurin:21-jre-alpine
+ARG MODULE
+ENV MODULE=${MODULE}
+
+# Non-root user.
+RUN addgroup -S jrpay && adduser -S jrpay -G jrpay
+WORKDIR /app
+
+COPY --from=builder /workspace/${MODULE}/build/libs/*.jar /app/app.jar
+RUN chown -R jrpay:jrpay /app
+USER jrpay
+
+# Spring Boot health endpoint port matches the management.server.port from
+# each service's application*.yml; the compose file maps the service port too.
+HEALTHCHECK --interval=15s --timeout=3s --retries=10 --start-period=30s \
+  CMD wget -qO- http://localhost:${MGMT_PORT:-9091}/actuator/health || exit 1
+
+ENTRYPOINT ["sh", "-c", "exec java $JAVA_OPTS -jar /app/app.jar"]

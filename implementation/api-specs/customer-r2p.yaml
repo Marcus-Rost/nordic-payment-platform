@@ -1,0 +1,677 @@
+openapi: 3.1.0
+info:
+  title: JRPay — Customer Request-to-Pay
+  version: 1.0.0
+  description: |
+    Customer-facing Request-to-Pay (SRTP, EPC024) endpoints. Realises
+    UC-G11 (accept & pay now), UC-G12 (decline), UC-G13 (defer / pay later),
+    UC-G14 (request amendment).
+
+    Hosted by A3 (bill-payment) exposed to customers through A4. SCA with
+    dynamic linking (`gui/architecture/DYNAMIC_LINKING.md` class `payment`
+    for accept, class `payment-schedule` for defer) is required on the
+    mutating operations that result in a debit of the customer's account.
+
+    Related Kafka topics (already in place on the backend): `r2p.received`,
+    `r2p.status-updates`. Linkage to UC-G05/UC-G07 is via `paymentId`
+    /`scheduledPaymentId` returned on accept/defer.
+
+    See `shared-schemas.yaml` for enums + Problem envelope + pagination.
+
+servers:
+  - url: "https://api.{env}.jrpay.example"
+    variables: { env: { default: dev } }
+  - url: "http://localhost:8094"
+    description: Local dev (A4 port; proxies to A3)
+
+tags:
+  - name: R2P
+    description: Inbox + detail
+  - name: R2P-Accept
+    description: UC-G11 accept & pay now
+  - name: R2P-Decline
+    description: UC-G12 decline with reason
+  - name: R2P-Defer
+    description: UC-G13 schedule for later execution
+  - name: R2P-Amend
+    description: UC-G14 propose amendment to merchant
+
+paths:
+  #############################################################################
+  # Inbox + detail
+  #############################################################################
+  /api/v1/customer/r2p:
+    get:
+      tags: [R2P]
+      summary: List R2P requests in the customer's inbox
+      description: |
+        Paginated list. Filter by status (multi-value). Default filter is
+        `PENDING,DEFERRED,AMENDMENT_REQUESTED`. Sorted by `dueDate` ascending
+        for pending; by `updatedAt` descending otherwise.
+      operationId: listR2p
+      security:
+        - OAuth2Customer: [payments:read]
+      parameters:
+        - name: status
+          in: query
+          required: false
+          schema:
+            type: array
+            items: { $ref: "shared-schemas.yaml#/components/schemas/R2pStatus" }
+          style: form
+          explode: true
+        - name: merchantQuery
+          in: query
+          description: Free-text substring match on merchant display name.
+          schema: { type: string }
+        - $ref: "shared-schemas.yaml#/components/parameters/PageNumber"
+        - $ref: "shared-schemas.yaml#/components/parameters/PageSize"
+        - $ref: "shared-schemas.yaml#/components/parameters/SortAsc"
+        - $ref: "shared-schemas.yaml#/components/parameters/AcceptLanguage"
+        - $ref: "shared-schemas.yaml#/components/parameters/TraceParent"
+      responses:
+        "200":
+          description: Paginated R2P summaries.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, page]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/R2pSummary" }
+                  page: { $ref: "shared-schemas.yaml#/components/schemas/PageMeta" }
+              examples:
+                pending:
+                  value:
+                    items:
+                      - requestId: "7f4e6b3f-2c9b-4d6c-9b29-2d58b8e41c77"
+                        merchantName: "Hafslund Strøm AS"
+                        merchantVerified: true
+                        amount: "1234.56"
+                        currency: "NOK"
+                        dueDate: "2026-05-02"
+                        status: PENDING
+                        reference: "1234567890123"
+                        receivedAt: "2026-04-24T08:15:00.000Z"
+                    page: { page: 0, size: 25, totalElements: 1, totalPages: 1 }
+        "401": { $ref: "shared-schemas.yaml#/components/responses/Problem401" }
+        "403": { $ref: "shared-schemas.yaml#/components/responses/Problem403" }
+        "429": { $ref: "shared-schemas.yaml#/components/responses/Problem429" }
+
+  /api/v1/customer/r2p/{requestId}:
+    get:
+      tags: [R2P]
+      summary: R2P detail
+      description: |
+        Full R2P record including merchant metadata, eIDAS-signature status
+        (drives CLI-F50 "verified" badge), invoice-PDF signed URL (if the
+        merchant supplied one; TTL per `SIGNED_URL_CONVENTIONS.md`),
+        amendments-allowed flag (UC-G14 AF-01), and linked
+        `paymentId`/`scheduledPaymentId` once present.
+      operationId: getR2p
+      security:
+        - OAuth2Customer: [payments:read]
+      parameters:
+        - $ref: "#/components/parameters/RequestId"
+      responses:
+        "200":
+          description: R2P detail.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/R2pDetail" }
+        "404": { $ref: "shared-schemas.yaml#/components/responses/Problem404" }
+
+  #############################################################################
+  # Accept (UC-G11)
+  #############################################################################
+  /api/v1/customer/r2p/{requestId}/accept:
+    post:
+      tags: [R2P-Accept]
+      summary: Accept and pay now (UC-G11)
+      description: |
+        Accepts the R2P and initiates a payment using the R2P's immutable
+        creditor IBAN / name / amount / currency / reference. Backing
+        implementation fans into the UC-G05 pipeline: SCA with dynamic-linking
+        class `payment` bound to `{paymentId, amount, currency, creditorIban,
+        creditorName, executionMode}` is required.
+
+        If the customer's chosen debtor account is eligible for the low-value
+        SCA exemption (PSD2 RTS Art. 16), `202` with `exempt=true` is returned
+        and no SCA challenge is needed — the client receives a step-up token
+        directly.
+      operationId: acceptR2p
+      security:
+        - OAuth2Customer: [payments:initiate]
+      parameters:
+        - $ref: "#/components/parameters/RequestId"
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+        - $ref: "shared-schemas.yaml#/components/parameters/StepUpToken"
+        - $ref: "shared-schemas.yaml#/components/parameters/DeviceIntegrity"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/R2pAcceptRequest" }
+      responses:
+        "200":
+          description: Payment submitted; final state returned if synchronous.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/R2pAcceptAck" }
+        "202":
+          description: Requires SCA before submission.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/R2pAcceptPendingSca" }
+        "403": { $ref: "shared-schemas.yaml#/components/responses/Problem403" }
+        "404": { $ref: "shared-schemas.yaml#/components/responses/Problem404" }
+        "409":
+          description: |
+            Possible returns:
+            - `urn:problem:r2p-already-acted` — the R2P was previously
+              accepted / declined / deferred (race / double-click).
+            - `urn:problem:idempotency-key-conflict` — replayed key with
+              different body.
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+        "410":
+          description: |
+            `urn:problem:r2p-cancelled` (merchant cancelled) or
+            `urn:problem:r2p-expired` (past due date; some banks reject
+            after expiry, we allow but surface a warning — this response
+            is only emitted when the backend config disallows late accept).
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+        "422":
+          description: Business-rule rejection (insufficient funds, account frozen, …).
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+
+  #############################################################################
+  # Decline (UC-G12)
+  #############################################################################
+  /api/v1/customer/r2p/{requestId}/decline:
+    post:
+      tags: [R2P-Decline]
+      summary: Decline an R2P (UC-G12)
+      description: |
+        Records the customer's decline reason and triggers A3 to emit a
+        `pain.014` rejection to the originating merchant network. Decline is
+        final; undo is not supported (UC-G12 §13). Customer-visible and
+        merchant-visible copies use distinct templates; the free-text `note`
+        is merchant-visible.
+      operationId: declineR2p
+      security:
+        - OAuth2Customer: [payments:initiate]
+      parameters:
+        - $ref: "#/components/parameters/RequestId"
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/R2pDeclineRequest" }
+      responses:
+        "200":
+          description: R2P declined.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/R2pDetail" }
+        "404": { $ref: "shared-schemas.yaml#/components/responses/Problem404" }
+        "409":
+          description: urn:problem:r2p-already-acted
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+        "410":
+          description: urn:problem:r2p-cancelled | urn:problem:r2p-expired
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+        "422": { $ref: "shared-schemas.yaml#/components/responses/Problem422" }
+
+  #############################################################################
+  # Defer — schedule (UC-G13)
+  #############################################################################
+  /api/v1/customer/r2p/{requestId}/defer:
+    post:
+      tags: [R2P-Defer]
+      summary: Defer — accept & pay later (UC-G13)
+      description: |
+        Schedules a future-dated payment using the R2P's immutable envelope.
+        `executeAt` must be strictly after now and on or before the R2P's
+        `dueDate` (UC-G13 AF-01). SCA is required with dynamic-linking class
+        `payment-schedule` bound to `{scheduleId, amount, currency,
+        creditorIban, creditorName, executeAt, executionMode}`.
+
+        Internally, A3 creates the schedule via A4 and links it back as
+        `scheduledPaymentId` on the R2P. On execution day, UC-G07 applies; on
+        success, A3 transitions the R2P to `ACCEPTED`.
+      operationId: deferR2p
+      security:
+        - OAuth2Customer: [payments:initiate]
+      parameters:
+        - $ref: "#/components/parameters/RequestId"
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+        - $ref: "shared-schemas.yaml#/components/parameters/StepUpToken"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/R2pDeferRequest" }
+      responses:
+        "200":
+          description: Deferred; scheduled payment created.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/R2pDeferAck" }
+        "202":
+          description: Requires SCA.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/R2pDeferPendingSca" }
+        "400":
+          description: urn:problem:invalid-input — `executeAt` before now or after due date.
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+        "404": { $ref: "shared-schemas.yaml#/components/responses/Problem404" }
+        "409":
+          description: urn:problem:r2p-already-acted
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+        "410":
+          description: urn:problem:r2p-cancelled | urn:problem:r2p-expired
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+        "503": { $ref: "shared-schemas.yaml#/components/responses/Problem503" }
+
+  /api/v1/customer/r2p/{requestId}/defer/cancel:
+    post:
+      tags: [R2P-Defer]
+      summary: Cancel a deferred R2P (UC-G13 AF-03)
+      description: |
+        Removes the linked scheduled payment and returns the R2P to `PENDING`
+        status. Only effective while the schedule has not yet executed; once
+        the schedule's `executeAt` has passed or execution has started, this
+        returns `409 urn:problem:too-late-to-cancel`.
+      operationId: cancelR2pDefer
+      security:
+        - OAuth2Customer: [payments:cancel]
+      parameters:
+        - $ref: "#/components/parameters/RequestId"
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+      responses:
+        "200":
+          description: Cancelled; R2P back to PENDING.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/R2pDetail" }
+        "404": { $ref: "shared-schemas.yaml#/components/responses/Problem404" }
+        "409":
+          description: urn:problem:too-late-to-cancel
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+
+  #############################################################################
+  # Amend (UC-G14)
+  #############################################################################
+  /api/v1/customer/r2p/{requestId}/amend:
+    post:
+      tags: [R2P-Amend]
+      summary: Propose an amendment to the merchant (UC-G14)
+      description: |
+        Records the customer's amendment proposal and forwards it to the
+        merchant via the scheme's amendment variant. R2P transitions to
+        `AMENDMENT_REQUESTED`. No SCA — this is a pre-payment action and no
+        funds move.
+
+        At least one of `proposedAmount` / `proposedDueDate` must differ from
+        the original R2P envelope (UC-G14 AF-02). Creditor IBAN is **not**
+        amendable (UC-G14 §13).
+      operationId: amendR2p
+      security:
+        - OAuth2Customer: [payments:initiate]
+      parameters:
+        - $ref: "#/components/parameters/RequestId"
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/R2pAmendRequest" }
+      responses:
+        "200":
+          description: Amendment sent; R2P in AMENDMENT_REQUESTED.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/R2pDetail" }
+        "400": { $ref: "shared-schemas.yaml#/components/responses/Problem400" }
+        "404": { $ref: "shared-schemas.yaml#/components/responses/Problem404" }
+        "409":
+          description: |
+            `urn:problem:amendment-not-allowed` (merchant's R2P disallowed
+            amendments) or `urn:problem:r2p-already-acted`.
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+        "410":
+          description: urn:problem:r2p-cancelled | urn:problem:r2p-expired
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+
+  /api/v1/customer/r2p/{requestId}/amend/cancel:
+    post:
+      tags: [R2P-Amend]
+      summary: Withdraw a pending amendment request (UC-G14 AF-05)
+      description: |
+        Customer changes their mind before the merchant responds. R2P returns
+        to `PENDING`; the withdrawal is forwarded to the merchant (informational
+        only).
+      operationId: cancelR2pAmend
+      security:
+        - OAuth2Customer: [payments:initiate]
+      parameters:
+        - $ref: "#/components/parameters/RequestId"
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+      responses:
+        "200":
+          description: Cancelled; R2P back to PENDING.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/R2pDetail" }
+        "404": { $ref: "shared-schemas.yaml#/components/responses/Problem404" }
+        "409":
+          description: urn:problem:r2p-already-acted — merchant has already responded.
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+
+components:
+  securitySchemes:
+    OAuth2Customer:
+      $ref: "shared-schemas.yaml#/components/securitySchemes/OAuth2Customer"
+
+  parameters:
+    RequestId:
+      name: requestId
+      in: path
+      required: true
+      description: R2P request identifier (A3-issued UUID).
+      schema: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+
+  schemas:
+    #########################################################################
+    # R2P summaries and detail
+    #########################################################################
+    R2pSummary:
+      type: object
+      required:
+        - requestId
+        - merchantName
+        - amount
+        - currency
+        - dueDate
+        - status
+        - receivedAt
+      properties:
+        requestId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+        merchantName: { $ref: "shared-schemas.yaml#/components/schemas/Name" }
+        merchantVerified:
+          type: boolean
+          description: |
+            `true` when the merchant's eIDAS signature on the R2P envelope
+            validated. `false` triggers CLI-F50 "unverified sender" warning
+            (UC-G11 AF-03).
+        merchantLogoUrl: { type: string, format: uri }
+        amount: { $ref: "shared-schemas.yaml#/components/schemas/MonetaryAmount" }
+        currency: { $ref: "shared-schemas.yaml#/components/schemas/Currency" }
+        dueDate: { $ref: "shared-schemas.yaml#/components/schemas/LocalDate" }
+        status: { $ref: "shared-schemas.yaml#/components/schemas/R2pStatus" }
+        reference:
+          type: string
+          description: Structured reference (typically Norwegian KID).
+          maxLength: 140
+        receivedAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        updatedAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        requestedExecutionMode: { $ref: "shared-schemas.yaml#/components/schemas/ExecutionMode" }
+
+    R2pDetail:
+      allOf:
+        - $ref: "#/components/schemas/R2pSummary"
+        - type: object
+          properties:
+            merchantId:
+              type: string
+              description: Stable merchant identifier (scheme-specific, e.g. Bits registry id).
+            description:
+              type: string
+              maxLength: 280
+            invoicePdfUrl:
+              type: string
+              format: uri
+              description: |
+                Single-use, short-TTL signed URL per
+                `gui/architecture/SIGNED_URL_CONVENTIONS.md`. Absent when
+                the merchant did not supply an invoice PDF.
+            invoicePdfExpiresAt:
+              $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant"
+            creditorIban: { $ref: "shared-schemas.yaml#/components/schemas/Iban" }
+            creditorName: { $ref: "shared-schemas.yaml#/components/schemas/Name" }
+            amendmentAllowed:
+              type: boolean
+              description: |
+                `true` when the merchant's envelope permits UC-G14. When
+                `false`, the **Request amendment** action is disabled
+                (UC-G14 AF-01).
+            paymentId:
+              description: |
+                Set once an accept (UC-G11) has produced a payment. The
+                terminal payment status (SETTLED / REJECTED / RETURNED) is
+                discoverable via `customer-payments.yaml`.
+              $ref: "shared-schemas.yaml#/components/schemas/Uuid"
+            scheduledPaymentId:
+              description: Set once a defer (UC-G13) has produced a schedule.
+              $ref: "shared-schemas.yaml#/components/schemas/Uuid"
+            declineReason:
+              $ref: "shared-schemas.yaml#/components/schemas/R2pDeclineReason"
+            declineNote:
+              type: string
+              maxLength: 280
+            amendmentRejected:
+              type: boolean
+              description: |
+                `true` once the merchant has refused an amendment request
+                and the R2P returned to PENDING with an annotation banner
+                (UC-G14 §6 step 7).
+            amendment:
+              description: Latest amendment proposal (if AMENDMENT_REQUESTED or history).
+              type: object
+              additionalProperties: false
+              required: [proposedAt]
+              properties:
+                proposedAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+                proposedAmount: { $ref: "shared-schemas.yaml#/components/schemas/MonetaryAmount" }
+                proposedDueDate: { $ref: "shared-schemas.yaml#/components/schemas/LocalDate" }
+                reason:
+                  type: string
+                  maxLength: 280
+            replacedBy:
+              description: |
+                When this R2P's status is `REPLACED`, the new R2P issued by
+                the merchant as a result of the accepted amendment.
+              $ref: "shared-schemas.yaml#/components/schemas/Uuid"
+            replaces:
+              description: |
+                Set on the new R2P when it was generated to replace a prior
+                R2P after the merchant accepted an amendment.
+              $ref: "shared-schemas.yaml#/components/schemas/Uuid"
+            history:
+              type: array
+              description: State-transition trail (oldest → newest).
+              items:
+                type: object
+                required: [at, status]
+                properties:
+                  at: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+                  status: { $ref: "shared-schemas.yaml#/components/schemas/R2pStatus" }
+                  actor:
+                    type: string
+                    enum: [CUSTOMER, MERCHANT, SYSTEM]
+                  note: { type: string, maxLength: 280 }
+
+    #########################################################################
+    # Accept request/response
+    #########################################################################
+    R2pAcceptRequest:
+      type: object
+      required: [debtorAccountId]
+      additionalProperties: false
+      properties:
+        debtorAccountId:
+          type: string
+          description: Account to debit. Must be one of the customer's ACTIVE accounts.
+        executionMode:
+          description: |
+            Override the R2P's requested mode. If omitted, the R2P's
+            `requestedExecutionMode` is used. Typically `INSTANT`.
+          $ref: "shared-schemas.yaml#/components/schemas/ExecutionMode"
+        vopResult:
+          description: |
+            VoP outcome observed by the client (UC-G05 §6 step 3). The
+            server re-runs VoP on submit, but this value lets the server
+            correlate the original NO_MATCH-override justification.
+          $ref: "shared-schemas.yaml#/components/schemas/VoPResult"
+        vopPayerOverride:
+          type: boolean
+          description: |
+            `true` if the customer explicitly overrode a NO_MATCH VoP
+            outcome (UC-G11 AF-05). Signals +0.3 fraud-risk weighting on A5.
+
+    R2pAcceptAck:
+      type: object
+      required: [requestId, paymentId, status]
+      properties:
+        requestId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+        paymentId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+        status: { $ref: "shared-schemas.yaml#/components/schemas/PaymentStatus" }
+        clearingPath:
+          type: string
+          enum: [INSTANT, NICS, BOOK_TRANSFER]
+        settlementInstant:
+          $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant"
+        receiptUrl: { type: string, format: uri }
+
+    R2pAcceptPendingSca:
+      type: object
+      required: [requestId, paymentId, scaSessionId, dl_hash]
+      properties:
+        requestId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+        paymentId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+        scaSessionId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+        dl_hash:
+          type: string
+          description: SCA dynamic-linking hash (class `payment`).
+          pattern: "^[0-9a-f]{64}$"
+        exempt:
+          type: boolean
+          description: |
+            `true` when the server determined an SCA exemption applied; the
+            client still receives a step-up token and proceeds without a
+            challenge (UC-G51 AF-05).
+        stepUpToken:
+          type: string
+          description: Present only when `exempt=true`.
+        challenge:
+          type: object
+          additionalProperties: true
+
+    #########################################################################
+    # Decline request
+    #########################################################################
+    R2pDeclineRequest:
+      type: object
+      required: [reasonCode]
+      additionalProperties: false
+      properties:
+        reasonCode: { $ref: "shared-schemas.yaml#/components/schemas/R2pDeclineReason" }
+        reasonNote:
+          type: string
+          maxLength: 280
+          description: |
+            Merchant-visible free text (UC-G12 §6 step 3). Required when
+            `reasonCode=OTHER`, minimum 10 characters (server-enforced).
+
+    #########################################################################
+    # Defer request/response
+    #########################################################################
+    R2pDeferRequest:
+      type: object
+      required: [debtorAccountId, executeAt]
+      additionalProperties: false
+      properties:
+        debtorAccountId: { type: string }
+        executeAt:
+          description: |
+            Target execution instant. Must be strictly after now and ≤ the
+            R2P's `dueDate` at 23:59:59.999 UTC (UC-G13 AF-01). Server
+            rejects with `400 urn:problem:invalid-input` otherwise.
+          $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant"
+        executionMode:
+          $ref: "shared-schemas.yaml#/components/schemas/ExecutionMode"
+        note:
+          type: string
+          maxLength: 280
+          description: Customer's private note (not merchant-visible).
+
+    R2pDeferAck:
+      type: object
+      required: [requestId, scheduledPaymentId, executeAt, status]
+      properties:
+        requestId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+        scheduledPaymentId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+        executeAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        status: { $ref: "shared-schemas.yaml#/components/schemas/R2pStatus" }
+
+    R2pDeferPendingSca:
+      type: object
+      required: [requestId, scheduledPaymentId, scaSessionId, dl_hash]
+      properties:
+        requestId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+        scheduledPaymentId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+        scaSessionId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+        dl_hash:
+          type: string
+          description: SCA dynamic-linking hash (class `payment-schedule`).
+          pattern: "^[0-9a-f]{64}$"
+        exempt: { type: boolean }
+        stepUpToken: { type: string }
+        challenge:
+          type: object
+          additionalProperties: true
+
+    #########################################################################
+    # Amendment request
+    #########################################################################
+    R2pAmendRequest:
+      type: object
+      additionalProperties: false
+      description: |
+        At least one of `proposedAmount` / `proposedDueDate` must differ
+        from the original (UC-G14 AF-02). Server-enforced.
+      properties:
+        proposedAmount: { $ref: "shared-schemas.yaml#/components/schemas/MonetaryAmount" }
+        proposedDueDate: { $ref: "shared-schemas.yaml#/components/schemas/LocalDate" }
+        reason:
+          type: string
+          maxLength: 280
+          description: Merchant-visible free text (UC-G14 §6 step 2).

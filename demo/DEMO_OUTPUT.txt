@@ -1,0 +1,82 @@
+=========================================
+  JRPay — LIVE Payment Demo
+=========================================
+
+=== BEFORE: Initial Balances ===
+Debtor (Kari Hansen):
+{
+    "accountId": "NO9386011117947",
+    "bookedBalance": 50000.0,
+    "reservedAmount": 0.0,
+    "availableBalance": 50000.0,
+    "currency": "NOK"
+}
+Creditor (Ola Nordmann AS):
+{
+    "accountId": "NO1234567890123",
+    "bookedBalance": 10000.0,
+    "reservedAmount": 0.0,
+    "availableBalance": 10000.0,
+    "currency": "NOK"
+}
+
+=== VoP Check: Verify beneficiary before payment ===
+{
+    "requestId": "pay-vop",
+    "result": "MATCH",
+    "actualName": null,
+    "similarityScore": 1.0,
+    "responseTimeMs": 3
+}
+
+=== PAYMENT: Transfer 5,000 NOK from Kari → Ola Nordmann AS ===
+{
+    "transactionId": "PAY-DEMO-001",
+    "status": "SETTLED",
+    "debtor": {
+        "accountId": "NO9386011117947",
+        "holderName": "Kari Hansen",
+        "currency": "NOK",
+        "bookedBalance": 45000.0,
+        "reservedAmount": 0.0,
+        "availableBalance": 45000.0,
+        "status": "ACTIVE"
+    },
+    "creditor": {
+        "accountId": "NO1234567890123",
+        "holderName": "Ola Nordmann AS",
+        "currency": "NOK",
+        "bookedBalance": 15000.0,
+        "reservedAmount": 0.0,
+        "availableBalance": 15000.0,
+        "status": "ACTIVE"
+    }
+}
+
+=== AFTER: Updated Balances ===
+Debtor (Kari Hansen):
+{
+    "accountId": "NO9386011117947",
+    "bookedBalance": 45000.0,
+    "reservedAmount": 0.0,
+    "availableBalance": 45000.0,
+    "currency": "NOK"
+}
+Creditor (Ola Nordmann AS):
+{
+    "accountId": "NO1234567890123",
+    "bookedBalance": 15000.0,
+    "reservedAmount": 0.0,
+    "availableBalance": 15000.0,
+    "currency": "NOK"
+}
+
+=========================================
+  PAYMENT COMPLETE
+  5,000 NOK moved: Kari → Ola Nordmann AS
+=========================================
+
+Conservation of money verified:
+  Before: 50,000 + 10,000 = 60,000 NOK
+  After:  45,000 + 15,000 = 60,000 NOK
+  No money created or destroyed.

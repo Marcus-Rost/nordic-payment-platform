@@ -1,0 +1,50 @@
+spring:
+  application:
+    name: jrpay-psd2-api
+  datasource:
+    url: jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5444}/psd2
+    username: ${DB_USER:psd2}
+    password: ${DB_PASSWORD:psd2}
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    open-in-view: false
+  flyway:
+    enabled: true
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP:localhost:9092}
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+      acks: all
+      properties:
+        enable.idempotence: true
+
+server:
+  port: 8094
+management:
+  server:
+    port: 9094
+
+jrpay:
+  psd2:
+    jwt:
+      jwks-uri: ${JRPAY_PSD2_JWKS_URI:http://localhost:8097/oauth2/jwks}
+    identity:
+      base-url: ${JRPAY_PSD2_IDENTITY_BASE_URL:http://localhost:8097}
+      client-id: ${JRPAY_PSD2_IDENTITY_CLIENT_ID:jrpay-a4-service}
+      client-secret: ${JRPAY_PSD2_IDENTITY_CLIENT_SECRET:a4-service-secret}
+    vop:
+      base-url: ${JRPAY_PSD2_VOP_BASE_URL:http://localhost:8096}
+      max-per-window: 30
+      window-seconds: 60
+    payments:
+      duplicate-window-seconds: 120
+      refresh-min-interval-seconds: 900
+    stream:
+      ttl: PT5M
+      heartbeat-ms: 15000
+    kafka:
+      group-id: jrpay-psd2-api
+      ledger-events-topic: ledger.events
+      payment-status-topic: payment.status-updates

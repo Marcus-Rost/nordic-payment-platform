@@ -1,0 +1,651 @@
+openapi: 3.1.0
+info:
+  title: JRPay — Customer Notifications (Inbox + Preferences + SSE)
+  version: 1.0.0
+  description: |
+    Customer-facing notification surface. Realises UC-G19 (fraud-hold
+    notification), UC-G20 (sanctions-block notification), UC-G21
+    (preferences), UC-G29 (push deep-link / device registration), UC-G80
+    (inbox browse).
+
+    Endpoints cover:
+    - Inbox list / detail / read-state / soft-delete
+    - SSE stream for cross-device sync (`SSE_CONVENTIONS.md`)
+    - Preferences matrix (category × channel)
+    - Push-device registration + per-device removal
+    - Email / phone verification round-trips triggered from preferences
+      (the profile-change itself lives in `customer-profile.yaml`; this
+      spec only starts the verification loop for a channel-activation
+      context)
+
+    Hosted by the new `jrpay-notifications` module (Phase 2G). Kafka
+    consumers project `payment.status-updates`, `consent.*`,
+    `mandate.pre-debit`, `fraud.*`, `sanctions.*`, `audit.*` into per-
+    customer inbox rows.
+
+    See `shared-schemas.yaml` for enums + Problem envelope + pagination.
+
+servers:
+  - url: "https://api.{env}.jrpay.example"
+    variables: { env: { default: dev } }
+  - url: "http://localhost:8098"
+    description: Local dev (jrpay-notifications module)
+
+tags:
+  - name: Inbox
+    description: UC-G19 / G20 / G80 — list / detail / read / delete
+  - name: NotificationStream
+    description: SSE cross-device sync per SSE_CONVENTIONS.md
+  - name: Preferences
+    description: UC-G21 — category × channel matrix
+  - name: Devices
+    description: UC-G29 — push device registration / removal
+  - name: ChannelVerification
+    description: Email / phone OTP verification initiated from preferences
+
+paths:
+  #############################################################################
+  # Inbox (UC-G80, UC-G19, UC-G20)
+  #############################################################################
+  /api/v1/customer/notifications:
+    get:
+      tags: [Inbox]
+      summary: List inbox notifications (UC-G80 §6.1)
+      description: |
+        Paginated inbox. Soft-deleted items are excluded unless
+        `includeDeleted=true`. `modifiedSince` supports reconciliation after
+        SSE drops (UC-G80 §6.5 / SSE_CONVENTIONS.md).
+      operationId: listNotifications
+      security:
+        - OAuth2Customer: [notifications:manage]
+      parameters:
+        - name: category
+          in: query
+          description: Multi-value category filter.
+          schema:
+            type: array
+            items: { $ref: "shared-schemas.yaml#/components/schemas/NotificationCategory" }
+          style: form
+          explode: true
+        - name: readState
+          in: query
+          schema:
+            type: string
+            enum: [all, unread, read]
+            default: all
+        - name: from
+          in: query
+          schema: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        - name: to
+          in: query
+          schema: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        - name: q
+          in: query
+          description: Free-text substring over counterparty / reference / body summary.
+          schema: { type: string }
+        - name: modifiedSince
+          in: query
+          description: Return items created or changed strictly after this instant.
+          schema: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        - name: includeDeleted
+          in: query
+          schema: { type: boolean, default: false }
+        - $ref: "shared-schemas.yaml#/components/parameters/PageNumber"
+        - $ref: "shared-schemas.yaml#/components/parameters/PageSize"
+        - $ref: "shared-schemas.yaml#/components/parameters/AcceptLanguage"
+      responses:
+        "200":
+          description: Paginated notifications + unread counter.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, page, unreadCount]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/Notification" }
+                  page: { $ref: "shared-schemas.yaml#/components/schemas/PageMeta" }
+                  unreadCount:
+                    type: integer
+                    minimum: 0
+
+  /api/v1/customer/notifications/{notificationId}:
+    get:
+      tags: [Inbox]
+      summary: Notification detail
+      operationId: getNotification
+      security:
+        - OAuth2Customer: [notifications:manage]
+      parameters:
+        - $ref: "#/components/parameters/NotificationId"
+      responses:
+        "200":
+          description: Notification detail.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Notification" }
+        "404": { $ref: "shared-schemas.yaml#/components/responses/Problem404" }
+    patch:
+      tags: [Inbox]
+      summary: Update read-state / soft-delete / restore (UC-G80 §6.3)
+      description: |
+        Partial update. Body may set `readAt` (null for unread), and/or
+        `deletedAt` (null to restore). `SECURITY_EVENTS`-category rows are
+        non-deletable (UC-G80 AF-07); attempting to set `deletedAt` on one
+        returns `409 urn:problem:pending-execution` (reused for locked
+        categories) with `details.reason=LOCKED_CATEGORY`.
+      operationId: updateNotification
+      security:
+        - OAuth2Customer: [notifications:manage]
+      parameters:
+        - $ref: "#/components/parameters/NotificationId"
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/NotificationPatch" }
+      responses:
+        "200":
+          description: Updated notification.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Notification" }
+        "404": { $ref: "shared-schemas.yaml#/components/responses/Problem404" }
+        "409": { $ref: "shared-schemas.yaml#/components/responses/Problem409" }
+
+  /api/v1/customer/notifications/mark-all-read:
+    post:
+      tags: [Inbox]
+      summary: Bulk "Mark all read" (UC-G80 §12)
+      operationId: markAllNotificationsRead
+      security:
+        - OAuth2Customer: [notifications:manage]
+      parameters:
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                category:
+                  type: array
+                  items: { $ref: "shared-schemas.yaml#/components/schemas/NotificationCategory" }
+                olderThan:
+                  $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant"
+      responses:
+        "200":
+          description: Bulk result.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [updatedCount]
+                properties:
+                  updatedCount: { type: integer, minimum: 0 }
+
+  #############################################################################
+  # SSE (UC-G80 §6.5)
+  #############################################################################
+  /api/v1/customer/notifications/stream-token:
+    post:
+      tags: [NotificationStream]
+      summary: Acquire one-time SSE stream token
+      description: |
+        Per SSE_CONVENTIONS.md. 5-minute TTL, single-use. Call before
+        opening the SSE.
+      operationId: notificationStreamToken
+      security:
+        - OAuth2Customer: [notifications:manage]
+      parameters:
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+      responses:
+        "200":
+          description: Stream token.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [streamToken, expiresIn]
+                properties:
+                  streamToken: { type: string }
+                  expiresIn:
+                    type: integer
+                    example: 300
+        "429": { $ref: "shared-schemas.yaml#/components/responses/Problem429" }
+
+  /api/v1/customer/notifications/stream:
+    get:
+      tags: [NotificationStream]
+      summary: Inbox SSE stream
+      description: |
+        Events per `SSE_CONVENTIONS.md`: `notification.new`,
+        `notification.read-state-changed`, `notification.deleted`.
+        Heartbeat every 15 s. Reconnect with exponential backoff + optional
+        `Last-Event-ID` header (replay window 5 min server-side).
+      operationId: notificationStream
+      parameters:
+        - name: token
+          in: query
+          required: true
+          schema: { type: string }
+        - name: Last-Event-ID
+          in: header
+          required: false
+          schema: { type: string }
+      responses:
+        "200":
+          description: text/event-stream
+          content:
+            text/event-stream:
+              schema: { type: string }
+        "401":
+          description: Token invalid / expired / already consumed.
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+
+  #############################################################################
+  # Preferences (UC-G21)
+  #############################################################################
+  /api/v1/customer/notifications/preferences:
+    get:
+      tags: [Preferences]
+      summary: Read the preferences matrix (UC-G21 §6 step 2)
+      operationId: getNotificationPreferences
+      security:
+        - OAuth2Customer: [notifications:manage]
+      responses:
+        "200":
+          description: Preferences matrix + channel endpoints (masked).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/NotificationPreferences" }
+    put:
+      tags: [Preferences]
+      summary: Replace the preferences matrix (UC-G21 §6 step 4)
+      description: |
+        Replaces the full matrix in one call. Clients PUT the entire object
+        as returned by GET, with modifications; server rejects attempts to
+        mutate locked cells (e.g., `inbox`, `SECURITY_EVENTS.email`) with
+        `422 urn:problem:invalid-input` + `details.lockedCells`.
+
+        Optimistic concurrency via `version`: client sends the version
+        returned on last GET; mismatches yield `409 urn:problem:
+        idempotency-key-conflict` reused for version conflict and include
+        the server's current version in `details.serverVersion`.
+      operationId: putNotificationPreferences
+      security:
+        - OAuth2Customer: [notifications:manage]
+      parameters:
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/NotificationPreferencesUpdate" }
+      responses:
+        "200":
+          description: Updated preferences.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/NotificationPreferences" }
+        "409": { $ref: "shared-schemas.yaml#/components/responses/Problem409" }
+        "422": { $ref: "shared-schemas.yaml#/components/responses/Problem422" }
+
+  #############################################################################
+  # Push device registration (UC-G29 + UC-G21 AF-05)
+  #############################################################################
+  /api/v1/customer/notifications/devices:
+    get:
+      tags: [Devices]
+      summary: List registered push devices
+      operationId: listDevices
+      security:
+        - OAuth2Customer: [notifications:manage]
+      responses:
+        "200":
+          description: Devices.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/PushDevice" }
+    post:
+      tags: [Devices]
+      summary: Register a push token (UC-G29 §6 step 2)
+      description: |
+        Registers an APNs / FCM token. The backend verifies the platform
+        and the app bundle id; cross-platform tokens are rejected.
+
+        Idempotency: re-registration with the same `token` value returns
+        `200` (not `409`) and refreshes `lastSeenAt`.
+      operationId: registerDevice
+      security:
+        - OAuth2Customer: [notifications:manage]
+      parameters:
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PushDeviceRegistration" }
+      responses:
+        "200":
+          description: Device re-registered (same token already on file).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PushDevice" }
+        "201":
+          description: New device registered.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PushDevice" }
+        "400": { $ref: "shared-schemas.yaml#/components/responses/Problem400" }
+
+  /api/v1/customer/notifications/devices/{deviceId}:
+    delete:
+      tags: [Devices]
+      summary: Remove a push device (UC-G21 AF-05)
+      operationId: removeDevice
+      security:
+        - OAuth2Customer: [notifications:manage]
+      parameters:
+        - name: deviceId
+          in: path
+          required: true
+          schema: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+      responses:
+        "204":
+          description: Removed.
+        "404": { $ref: "shared-schemas.yaml#/components/responses/Problem404" }
+
+  #############################################################################
+  # Channel verification (UC-G21 AF-01, AF-02)
+  #############################################################################
+  /api/v1/customer/notifications/email/verify:
+    post:
+      tags: [ChannelVerification]
+      summary: Re-send verification email (UC-G21 AF-01)
+      description: |
+        Triggers a verification-link email to the address currently on the
+        customer's profile. Does not change the address itself — that flow
+        lives in `customer-profile.yaml` (UC-G22 §6.2). Rate-limited to
+        3 / hour / user; returns `429` otherwise.
+      operationId: resendEmailVerification
+      security:
+        - OAuth2Customer: [notifications:manage]
+      parameters:
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+      responses:
+        "202":
+          description: Verification email dispatched.
+        "429": { $ref: "shared-schemas.yaml#/components/responses/Problem429" }
+
+  /api/v1/customer/notifications/phone/verify:
+    post:
+      tags: [ChannelVerification]
+      summary: Re-send SMS OTP for phone verification (UC-G21 AF-02)
+      operationId: resendPhoneVerification
+      security:
+        - OAuth2Customer: [notifications:manage]
+      parameters:
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+      responses:
+        "202":
+          description: OTP SMS dispatched.
+        "429": { $ref: "shared-schemas.yaml#/components/responses/Problem429" }
+
+components:
+  securitySchemes:
+    OAuth2Customer:
+      $ref: "shared-schemas.yaml#/components/securitySchemes/OAuth2Customer"
+
+  parameters:
+    NotificationId:
+      name: notificationId
+      in: path
+      required: true
+      schema: { $ref: "shared-schemas.yaml#/components/schemas/Ulid" }
+
+  schemas:
+    Notification:
+      type: object
+      required:
+        - id
+        - category
+        - priority
+        - titleKey
+        - bodySummaryKey
+        - createdAt
+      properties:
+        id: { $ref: "shared-schemas.yaml#/components/schemas/Ulid" }
+        category: { $ref: "shared-schemas.yaml#/components/schemas/NotificationCategory" }
+        priority:
+          type: string
+          enum: [info, warn, critical]
+        titleKey:
+          type: string
+          description: |
+            i18n catalogue key; the client localises. Copy is never
+            returned pre-rendered because the UI must render per its own
+            `Accept-Language` and a11y rules (UC-G80 §12).
+        bodySummaryKey: { type: string }
+        params:
+          type: object
+          additionalProperties: true
+          description: |
+            Parameters for interpolation into the i18n template (amount,
+            counterparty, caseRef, …). No PII beyond what the UI already
+            shows elsewhere; sanctions-block uses only the generic
+            counterparty name already visible on the payment detail
+            (UC-G20 §6 step 2).
+        createdAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        readAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        deletedAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        deepLink:
+          type: string
+          format: uri
+          description: |
+            Canonical deep-link (allowlist enforced by the mobile router —
+            UC-G29 §6 step 3). Absent if the notification has no target.
+          example: "jrpay://payment/550e8400-e29b-41d4-a716-446655440000"
+        actionHint:
+          type: string
+          enum: [view, act-now, none]
+        supportReference:
+          type: string
+          description: |
+            Generic support reference (for fraud-hold `caseRef`, sanctions-
+            block `caseRef`, profile-change audit ref, …). Copy-to-clipboard
+            affordance uses this.
+        locked:
+          type: boolean
+          description: |
+            `true` for SECURITY_EVENTS-category rows; the UI disables
+            delete / preference-change affordances.
+        relatedPaymentId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+        relatedR2pRequestId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+        relatedConsentId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+        relatedMandateId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+        relatedGdprRequestId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+
+    NotificationPatch:
+      type: object
+      additionalProperties: false
+      description: |
+        Body must include at least one of `readAt`, `deletedAt`. Use `null`
+        to clear (mark unread, or restore from soft-delete).
+      properties:
+        readAt:
+          description: |
+            Set to an instant to mark read; set to `null` to mark unread.
+            Server overwrites with its own clock when an instant is sent.
+          $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant"
+        deletedAt:
+          description: Set to an instant to soft-delete; `null` to restore.
+          $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant"
+
+    NotificationPreferences:
+      type: object
+      required: [version, channels, categories]
+      properties:
+        version:
+          type: integer
+          minimum: 0
+          description: Incremented on every save; optimistic-concurrency token.
+        channels:
+          type: object
+          required: [inbox, email, sms, push]
+          additionalProperties: false
+          properties:
+            inbox:
+              type: object
+              required: [enabled, locked]
+              description: |
+                Both `enabled` and `locked` are always `true` for the inbox
+                channel (the inbox cannot be disabled). Server always
+                returns `{enabled: true, locked: true}`; client ignores
+                attempts to set these fields on PUT.
+              properties:
+                enabled: { type: boolean }
+                locked: { type: boolean }
+            email:
+              type: object
+              required: [enabled]
+              properties:
+                enabled: { type: boolean }
+                address:
+                  type: string
+                  description: Masked ("o****@example.com").
+                verified: { type: boolean }
+            sms:
+              type: object
+              required: [enabled]
+              properties:
+                enabled: { type: boolean }
+                phone:
+                  type: string
+                  description: Masked ("+47 •••• ••34").
+                verified: { type: boolean }
+            push:
+              type: object
+              required: [enabled]
+              properties:
+                enabled: { type: boolean }
+                devices:
+                  type: array
+                  items: { $ref: "#/components/schemas/PushDevice" }
+        categories:
+          type: object
+          description: |
+            One entry per `NotificationCategory` enum value. Each entry is
+            a per-channel boolean map plus optional `locked` list of
+            channels that cannot be toggled (UC-G21 AF-04).
+          additionalProperties:
+            $ref: "#/components/schemas/CategoryPreferences"
+
+    CategoryPreferences:
+      type: object
+      additionalProperties: false
+      required: [inbox, email, sms, push]
+      properties:
+        inbox: { type: boolean }
+        email: { type: boolean }
+        sms: { type: boolean }
+        push: { type: boolean }
+        locked:
+          type: array
+          description: |
+            Channels locked for this category (e.g. `SECURITY_EVENTS` locks
+            all). Client disables UI for these.
+          items:
+            $ref: "shared-schemas.yaml#/components/schemas/NotificationChannel"
+
+    NotificationPreferencesUpdate:
+      type: object
+      required: [version, categories]
+      additionalProperties: false
+      properties:
+        version:
+          type: integer
+          minimum: 0
+          description: Must match the server's current version (optimistic lock).
+        channels:
+          type: object
+          additionalProperties: false
+          properties:
+            email:
+              type: object
+              properties:
+                enabled: { type: boolean }
+            sms:
+              type: object
+              properties:
+                enabled: { type: boolean }
+            push:
+              type: object
+              properties:
+                enabled: { type: boolean }
+        categories:
+          type: object
+          additionalProperties:
+            type: object
+            additionalProperties: false
+            properties:
+              inbox: { type: boolean }
+              email: { type: boolean }
+              sms: { type: boolean }
+              push: { type: boolean }
+
+    PushDevice:
+      type: object
+      required: [id, platform, name, registeredAt]
+      properties:
+        id: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+        platform:
+          type: string
+          enum: [APNS, FCM]
+        name:
+          type: string
+          description: Human-friendly device name ("iPhone 15 Pro").
+        model: { type: string }
+        osVersion: { type: string }
+        appVersion: { type: string }
+        registeredAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        lastSeenAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+
+    PushDeviceRegistration:
+      type: object
+      required: [platform, token, name]
+      additionalProperties: false
+      properties:
+        platform:
+          type: string
+          enum: [APNS, FCM]
+        token:
+          type: string
+          description: |
+            Raw APNs device token (hex or base64) / FCM registration id.
+            Stored server-side hashed; only the hash is logged.
+          minLength: 8
+          maxLength: 4096
+        name: { type: string, maxLength: 140 }
+        model: { type: string }
+        osVersion: { type: string }
+        appVersion: { type: string }
+        bundleId:
+          type: string
+          description: |
+            App bundle identifier (e.g., `com.jrpay.client`). Server
+            rejects registrations whose bundle id does not match the
+            client_id's registered bundle.

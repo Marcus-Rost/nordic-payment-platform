@@ -1,0 +1,771 @@
+openapi: 3.1.0
+info:
+  title: JRPay — Admin Status (Health, SLA, DLQ, Banners)
+  version: 1.0.0
+  description: |
+    Admin system-health dashboard + status-banner management
+    (UC-G42, UC-G54).
+
+    Dashboard surfaces: per-service health (proxied from Prometheus),
+    per-topic Kafka queue depth, three key SLAs (instant-payment p95,
+    fraud-alert age, sanctions-alert age), DLQ per topic with retry /
+    purge for SUPERVISOR+.
+
+    Status-banner management publishes to the banner service; UC-G54
+    consumers (customer GUIs, admin GUI, login screens) read via
+    `GET /api/v1/public/status` and `GET /api/v1/public/status/stream`.
+
+    Step-up SCA required on DLQ retry/purge (`action=DECIDE_FRAUD`-style
+    isn't right — we use `PUBLISH_STATUS_BANNER` for banner mutations
+    and define no dedicated DLQ action in the AdminAction enum; DLQ
+    retry/purge uses `PUBLISH_STATUS_BANNER` as the nearest registered
+    action with `resourceType=audit`, `resourceId=dlq:<topic>`) —
+    conservative until we widen `AdminAction`.
+
+    Banner mutations: step-up SCA with `action=PUBLISH_STATUS_BANNER`,
+    `resourceType=banner`.
+
+    See `shared-schemas.yaml` for enums + Problem envelope + pagination.
+
+servers:
+  - url: "https://admin-api.{env}.jrpay.example"
+    variables: { env: { default: dev } }
+  - url: "https://api.{env}.jrpay.example"
+    variables: { env: { default: dev } }
+    description: Public status surface (unauth)
+  - url: "http://localhost:8090"
+    description: Local dev (status aggregator / banner service)
+
+tags:
+  - name: System-Health
+    description: UC-G42 §6.1 — per-service health
+  - name: System-Queues
+    description: UC-G42 §6.2 — Kafka queue depth
+  - name: System-SLA
+    description: UC-G42 §6.3 — three key SLAs
+  - name: System-DLQ
+    description: UC-G42 §6.4 — DLQ viewer + retry/purge
+  - name: Status-Banner
+    description: UC-G42 §6.5 — banner publish / update / delete
+  - name: Public-Status
+    description: UC-G54 — public read + SSE (unauth)
+
+paths:
+  #############################################################################
+  # System health (UC-G42 §6.1)
+  #############################################################################
+  /api/v1/admin/system/health:
+    get:
+      tags: [System-Health]
+      summary: Service health snapshot (UC-G42 §6.1)
+      description: |
+        Aggregates Prometheus `up`, error rate, and p95 latency for every
+        backend service. Cacheable server-side for 10 s to limit
+        Prometheus load. When Prometheus is unreachable, the response
+        echoes the last-known snapshot with `staleAt` set.
+      operationId: getSystemHealth
+      security:
+        - OAuth2Admin: [system:read]
+      responses:
+        "200":
+          description: Health.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SystemHealth" }
+        "503":
+          description: Fresh data unavailable but no cache either (cold boot).
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+
+  /api/v1/admin/system/queues:
+    get:
+      tags: [System-Queues]
+      summary: Kafka queue depth per topic (UC-G42 §6.2)
+      operationId: getSystemQueues
+      security:
+        - OAuth2Admin: [system:read]
+      responses:
+        "200":
+          description: Queue snapshot.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/QueueSnapshot" }
+
+  /api/v1/admin/system/sla:
+    get:
+      tags: [System-SLA]
+      summary: SLA dashboard (UC-G42 §6.3)
+      description: |
+        Three canonical SLAs — instant payment p95 (target ≤ 5 s), fraud
+        resolution age (target ≤ 1 h), sanctions resolution age (target
+        ≤ 15 min). Each tile exposes a drill-through href to the offending
+        records (e.g., live sanctions hits overdue → UC-G34 queue).
+      operationId: getSystemSla
+      security:
+        - OAuth2Admin: [system:read]
+      responses:
+        "200":
+          description: SLA tiles.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SlaSnapshot" }
+
+  #############################################################################
+  # DLQ (UC-G42 §6.4)
+  #############################################################################
+  /api/v1/admin/system/dlq:
+    get:
+      tags: [System-DLQ]
+      summary: DLQ depth per topic + recent dead-letter samples
+      description: |
+        Expanding a topic returns up to `sampleSize` (default 10) recent
+        dead-letter payloads. PII is redacted server-side — the GUI
+        never holds raw dead-letter payloads.
+      operationId: getDlq
+      security:
+        - OAuth2Admin: [system:read]
+      parameters:
+        - name: topic
+          in: query
+          description: Restrict the response to this topic.
+          schema: { type: string }
+        - name: sampleSize
+          in: query
+          schema: { type: integer, minimum: 0, maximum: 50, default: 10 }
+      responses:
+        "200":
+          description: DLQ snapshot.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DlqSnapshot" }
+
+  /api/v1/admin/system/dlq/{topic}/retry:
+    post:
+      tags: [System-DLQ]
+      summary: Retry dead-letter messages (UC-G42 §6.4)
+      description: |
+        Retries the messages whose ids are supplied (or all if
+        `all=true`). Step-up SCA required (SUPERVISOR+). After the third
+        retry on the same message, the response includes
+        `details.eligibleForPurge=true` for that id so the UI can surface
+        the purge affordance.
+      operationId: retryDlq
+      security:
+        - OAuth2Admin: [system:read]
+      parameters:
+        - name: topic
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+        - $ref: "shared-schemas.yaml#/components/parameters/StepUpToken"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/DlqRetryRequest" }
+      responses:
+        "200":
+          description: Retry outcomes per message.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DlqRetryAck" }
+        "403":
+          description: urn:problem:dynamic-linking-mismatch
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+
+  /api/v1/admin/system/dlq/{topic}/purge:
+    delete:
+      tags: [System-DLQ]
+      summary: Purge selected dead-letter messages (SUPERVISOR)
+      description: |
+        Permanently removes the selected dead-letter messages after at
+        least 3 retry attempts each (UC-G42 AF-04). Step-up SCA required.
+      operationId: purgeDlq
+      security:
+        - OAuth2Admin: [system:read]
+      parameters:
+        - name: topic
+          in: path
+          required: true
+          schema: { type: string }
+        - name: ids
+          in: query
+          required: true
+          schema:
+            type: array
+            items: { type: string }
+          style: form
+          explode: true
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+        - $ref: "shared-schemas.yaml#/components/parameters/StepUpToken"
+      responses:
+        "200":
+          description: Purge outcomes.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [total, purged, notEligible]
+                properties:
+                  total: { type: integer }
+                  purged: { type: integer }
+                  notEligible:
+                    type: array
+                    description: Ids that had < 3 retries; still kept.
+                    items: { type: string }
+        "403":
+          description: Role missing or DL mismatch.
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+
+  #############################################################################
+  # Status banners (UC-G42 §6.5)
+  #############################################################################
+  /api/v1/admin/status/banners:
+    get:
+      tags: [Status-Banner]
+      summary: List status banners (UC-G42 §6.5)
+      operationId: listStatusBanners
+      security:
+        - OAuth2Admin: [system:read]
+      parameters:
+        - name: active
+          in: query
+          description: Default `true` — only banners whose validity window is current.
+          schema: { type: boolean, default: true }
+        - $ref: "shared-schemas.yaml#/components/parameters/PageNumber"
+        - $ref: "shared-schemas.yaml#/components/parameters/PageSize"
+      responses:
+        "200":
+          description: Paginated banners.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, page]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/StatusBanner" }
+                  page: { $ref: "shared-schemas.yaml#/components/schemas/PageMeta" }
+    post:
+      tags: [Status-Banner]
+      summary: Create a status banner (SUPERVISOR)
+      description: |
+        Creates and publishes (or schedules) a banner. Step-up SCA
+        required with `action=PUBLISH_STATUS_BANNER`.
+      operationId: createStatusBanner
+      security:
+        - OAuth2Admin: [system:read]
+      parameters:
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+        - $ref: "shared-schemas.yaml#/components/parameters/StepUpToken"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/StatusBannerUpsertRequest" }
+      responses:
+        "201":
+          description: Banner created.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StatusBanner" }
+        "403":
+          description: urn:problem:dynamic-linking-mismatch
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+
+  /api/v1/admin/status/banners/{bannerId}:
+    get:
+      tags: [Status-Banner]
+      summary: Banner detail
+      operationId: getStatusBanner
+      security:
+        - OAuth2Admin: [system:read]
+      parameters:
+        - $ref: "#/components/parameters/BannerId"
+      responses:
+        "200":
+          description: Banner detail.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StatusBanner" }
+        "404": { $ref: "shared-schemas.yaml#/components/responses/Problem404" }
+    patch:
+      tags: [Status-Banner]
+      summary: Update a banner (optimistic-concurrency via `version`)
+      description: |
+        Editing supports all mutable fields except `id`. `version`
+        enforces optimistic concurrency (UC-G42 AF-05); mismatch returns
+        `409` with the server's current version. Step-up SCA required.
+      operationId: updateStatusBanner
+      security:
+        - OAuth2Admin: [system:read]
+      parameters:
+        - $ref: "#/components/parameters/BannerId"
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+        - $ref: "shared-schemas.yaml#/components/parameters/StepUpToken"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/StatusBannerUpdateRequest" }
+      responses:
+        "200":
+          description: Updated.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StatusBanner" }
+        "409":
+          description: urn:problem:idempotency-key-conflict — stale `version`.
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+    delete:
+      tags: [Status-Banner]
+      summary: Resolve / remove a banner
+      description: |
+        Publishes a `banner.resolved` event and removes the banner from
+        the active set. Step-up SCA required.
+      operationId: deleteStatusBanner
+      security:
+        - OAuth2Admin: [system:read]
+      parameters:
+        - $ref: "#/components/parameters/BannerId"
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+        - $ref: "shared-schemas.yaml#/components/parameters/StepUpToken"
+      responses:
+        "204":
+          description: Removed.
+        "404": { $ref: "shared-schemas.yaml#/components/responses/Problem404" }
+
+  #############################################################################
+  # Public status (UC-G54)
+  #############################################################################
+  /api/v1/public/status:
+    get:
+      tags: [Public-Status]
+      summary: Active status banners (unauthenticated — UC-G54 §6 step 1)
+      description: |
+        Unauthenticated read; filters itself by audience via the
+        `X-Audience` header (`CUSTOMER` / `ADMIN`) — if absent, defaults
+        to `CUSTOMER`. Rate-limited per IP (3 concurrent connections per
+        IP on the matching SSE endpoint per SSE_CONVENTIONS.md §"Public
+        streams").
+      operationId: publicStatus
+      parameters:
+        - name: X-Audience
+          in: header
+          required: false
+          schema:
+            type: string
+            enum: [CUSTOMER, ADMIN]
+            default: CUSTOMER
+      responses:
+        "200":
+          description: Active banners.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PublicStatus" }
+        "429": { $ref: "shared-schemas.yaml#/components/responses/Problem429" }
+
+  /api/v1/public/status/stream:
+    get:
+      tags: [Public-Status]
+      summary: Public status SSE (UC-G54 §6 step 6)
+      description: |
+        Unauthenticated SSE for banner updates. Events:
+        `banner.published`, `banner.updated`, `banner.resolved`.
+        Heartbeat 15 s. Rate-limited per IP.
+      operationId: publicStatusStream
+      parameters:
+        - name: X-Audience
+          in: header
+          required: false
+          schema:
+            type: string
+            enum: [CUSTOMER, ADMIN]
+            default: CUSTOMER
+        - name: Last-Event-ID
+          in: header
+          required: false
+          schema: { type: string }
+      responses:
+        "200":
+          description: text/event-stream
+          content:
+            text/event-stream:
+              schema: { type: string }
+        "429": { $ref: "shared-schemas.yaml#/components/responses/Problem429" }
+
+components:
+  securitySchemes:
+    OAuth2Admin:
+      $ref: "shared-schemas.yaml#/components/securitySchemes/OAuth2Admin"
+
+  parameters:
+    BannerId:
+      name: bannerId
+      in: path
+      required: true
+      schema: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+
+  schemas:
+    SystemHealth:
+      type: object
+      required: [services, asOf]
+      properties:
+        asOf: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        staleAt:
+          description: |
+            Present when Prometheus is unavailable and the response is
+            served from cache. UI renders a "metrics unavailable" badge.
+          $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant"
+        services:
+          type: array
+          items: { $ref: "#/components/schemas/ServiceHealth" }
+
+    ServiceHealth:
+      type: object
+      required: [name, state]
+      properties:
+        name:
+          type: string
+          enum:
+            - a1-ledger
+            - a2-clearing
+            - a3-billpay
+            - a4-psd2
+            - a5-fraud
+            - a6-vop
+            - identity
+            - notifications
+            - audit-query
+        state:
+          type: string
+          enum: [UP, DEGRADED, DOWN, UNKNOWN]
+        errorRate1m:
+          type: number
+          minimum: 0
+          description: Fraction in [0, 1].
+        p50LatencyMs:
+          type: integer
+          minimum: 0
+        p95LatencyMs:
+          type: integer
+          minimum: 0
+        p99LatencyMs:
+          type: integer
+          minimum: 0
+        uptimeSeconds:
+          type: integer
+          minimum: 0
+        grafanaUrl:
+          type: string
+          format: uri
+          description: Drill-through URL (embedded iframe on the dashboard).
+
+    QueueSnapshot:
+      type: object
+      required: [topics, asOf]
+      properties:
+        asOf: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        topics:
+          type: array
+          items:
+            type: object
+            required: [topic, lag, threshold, alert]
+            properties:
+              topic: { type: string }
+              lag:
+                type: integer
+                minimum: 0
+                description: Consumer lag (records).
+              threshold:
+                type: integer
+                minimum: 0
+                description: Config-loaded alert threshold for this topic.
+              alert:
+                type: boolean
+                description: |
+                  `true` when `lag > threshold`.
+              sparkline24h:
+                type: array
+                description: Hourly buckets over the last 24 h (25 points).
+                items: { type: integer, minimum: 0 }
+                minItems: 25
+                maxItems: 25
+
+    SlaSnapshot:
+      type: object
+      required: [tiles, asOf]
+      properties:
+        asOf: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        tiles:
+          type: array
+          items: { $ref: "#/components/schemas/SlaTile" }
+
+    SlaTile:
+      type: object
+      required: [id, label, current, target, unit, status]
+      properties:
+        id:
+          type: string
+          enum:
+            - instant-payment-p95-latency
+            - fraud-resolution-age
+            - sanctions-resolution-age
+        label: { type: string }
+        current: { type: number }
+        target: { type: number }
+        unit:
+          type: string
+          enum: [SECONDS, MINUTES, HOURS]
+        status:
+          type: string
+          enum: [GREEN, AMBER, RED]
+        sparkline24h:
+          type: array
+          items: { type: number }
+          minItems: 25
+          maxItems: 25
+        drillThroughHref:
+          type: string
+          description: |
+            Relative admin-GUI route to the offending records (e.g.
+            `/sanctions?status=OPEN&slaBreached=true`).
+
+    DlqSnapshot:
+      type: object
+      required: [topics, asOf]
+      properties:
+        asOf: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        topics:
+          type: array
+          items:
+            type: object
+            required: [topic, depth]
+            properties:
+              topic: { type: string }
+              depth: { type: integer, minimum: 0 }
+              samples:
+                type: array
+                description: Up to `sampleSize` PII-redacted samples.
+                items: { $ref: "#/components/schemas/DlqSample" }
+
+    DlqSample:
+      type: object
+      required: [id, firstSeenAt, lastRetryAt, retryCount, failureReason]
+      properties:
+        id: { type: string }
+        firstSeenAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        lastRetryAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        retryCount: { type: integer, minimum: 0 }
+        failureReason: { type: string, maxLength: 280 }
+        payloadRedacted:
+          type: object
+          additionalProperties: true
+          description: |
+            Server-redacted payload — PII fields masked; only keys + types
+            + size hints surface here.
+        eligibleForPurge:
+          type: boolean
+          description: |
+            `true` when retryCount ≥ 3 (UC-G42 AF-04).
+
+    DlqRetryRequest:
+      type: object
+      additionalProperties: false
+      description: Exactly one of `ids` / `all` must be present.
+      properties:
+        ids:
+          type: array
+          items: { type: string }
+        all:
+          type: boolean
+
+    DlqRetryAck:
+      type: object
+      required: [total, retried, failed, results]
+      properties:
+        total: { type: integer }
+        retried: { type: integer }
+        failed: { type: integer }
+        results:
+          type: array
+          items:
+            type: object
+            required: [id, outcome]
+            properties:
+              id: { type: string }
+              outcome:
+                type: string
+                enum: [RETRIED, FAILED, NOT_FOUND, NOW_ELIGIBLE_FOR_PURGE]
+              errorKey: { type: string }
+
+    StatusBanner:
+      type: object
+      required:
+        - id
+        - version
+        - severity
+        - titleKey
+        - bodyKey
+        - audiences
+        - dismissible
+        - validFrom
+        - validUntil
+      properties:
+        id: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+        version:
+          type: integer
+          minimum: 0
+          description: Optimistic-concurrency token (incremented on every PATCH).
+        severity: { $ref: "shared-schemas.yaml#/components/schemas/BannerSeverity" }
+        titleKey:
+          type: string
+          description: i18n key for the banner title (UC-G54 §6 step 5).
+        bodyKey:
+          type: string
+          description: i18n key for the banner body.
+        params:
+          type: object
+          additionalProperties: true
+          description: |
+            Parameters interpolated into the i18n template (e.g. `startAt`,
+            `endAt`). Locale-sensitive formatting applied by the GUI.
+        audiences:
+          type: array
+          items: { $ref: "shared-schemas.yaml#/components/schemas/BannerAudience" }
+          minItems: 1
+        dismissible: { type: boolean }
+        validFrom: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        validUntil: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        featureScopes:
+          type: array
+          description: |
+            Feature tags a GUI may use to render an additional inline
+            warning on the relevant screen (UC-G54 AF-05).
+          items: { type: string }
+        moreInfoUrl:
+          type: string
+          format: uri
+        createdAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        createdBy: { type: string }
+        updatedAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        updatedBy: { type: string }
+
+    StatusBannerUpsertRequest:
+      type: object
+      required:
+        - severity
+        - titleKey
+        - bodyKey
+        - audiences
+        - dismissible
+        - validFrom
+        - validUntil
+        - notes
+      additionalProperties: false
+      properties:
+        severity: { $ref: "shared-schemas.yaml#/components/schemas/BannerSeverity" }
+        titleKey: { type: string }
+        bodyKey: { type: string }
+        params:
+          type: object
+          additionalProperties: true
+        audiences:
+          type: array
+          minItems: 1
+          items: { $ref: "shared-schemas.yaml#/components/schemas/BannerAudience" }
+        dismissible: { type: boolean }
+        validFrom: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        validUntil: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        featureScopes:
+          type: array
+          items: { type: string }
+        moreInfoUrl:
+          type: string
+          format: uri
+        notes:
+          type: string
+          minLength: 20
+          maxLength: 2000
+          description: Internal operator notes (audit log, not customer-visible).
+
+    StatusBannerUpdateRequest:
+      type: object
+      required: [version, notes]
+      additionalProperties: false
+      description: |
+        Partial update. Must echo the current `version` (UC-G42 AF-05);
+        server increments on success and returns the new version.
+      properties:
+        version: { type: integer, minimum: 0 }
+        severity: { $ref: "shared-schemas.yaml#/components/schemas/BannerSeverity" }
+        titleKey: { type: string }
+        bodyKey: { type: string }
+        params:
+          type: object
+          additionalProperties: true
+        audiences:
+          type: array
+          items: { $ref: "shared-schemas.yaml#/components/schemas/BannerAudience" }
+        dismissible: { type: boolean }
+        validFrom: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        validUntil: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        featureScopes:
+          type: array
+          items: { type: string }
+        moreInfoUrl:
+          type: string
+          format: uri
+        notes:
+          type: string
+          minLength: 20
+          maxLength: 2000
+
+    PublicStatus:
+      type: object
+      required: [banners]
+      properties:
+        banners:
+          type: array
+          description: |
+            Banners currently valid and matching the caller's audience.
+            Sorted by severity descending, then `validFrom` ascending.
+          items: { $ref: "#/components/schemas/PublicBanner" }
+
+    PublicBanner:
+      type: object
+      required: [id, severity, titleKey, bodyKey, audiences, validFrom, validUntil]
+      description: |
+        Subset of the admin `StatusBanner` safe for unauthenticated
+        exposure — no operator identifiers, no notes.
+      properties:
+        id: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+        severity: { $ref: "shared-schemas.yaml#/components/schemas/BannerSeverity" }
+        titleKey: { type: string }
+        bodyKey: { type: string }
+        params:
+          type: object
+          additionalProperties: true
+        audiences:
+          type: array
+          items: { $ref: "shared-schemas.yaml#/components/schemas/BannerAudience" }
+        dismissible: { type: boolean }
+        validFrom: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        validUntil: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        featureScopes:
+          type: array
+          items: { type: string }
+        moreInfoUrl:
+          type: string
+          format: uri

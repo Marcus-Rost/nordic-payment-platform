@@ -1,0 +1,147 @@
+{
+    "app": {
+        "title": "JRPay Admin",
+        "subtitle": "Operatør-konsoll"
+    },
+    "common": {
+        "cancel": "Avbryt",
+        "confirm": "Bekreft",
+        "save": "Lagre",
+        "search": "Søk",
+        "loading": "Laster …",
+        "retry": "Prøv igjen",
+        "close": "Lukk",
+        "actions": "Handlinger",
+        "details": "Detaljer",
+        "page": "Side",
+        "of": "av",
+        "next": "Neste",
+        "prev": "Forrige",
+        "yes": "Ja",
+        "no": "Nei",
+        "logout": "Logg ut",
+        "language": "Språk"
+    },
+    "login": {
+        "title": "Logg inn",
+        "subtitle": "Logg inn med BankID for å åpne operatør-konsollet.",
+        "continueWithBankId": "Fortsett med BankID",
+        "redirecting": "Omdirigerer …",
+        "scaNotice": "Mutasjoner krever steg-opp SCA per UC-G51."
+    },
+    "callback": {
+        "exchanging": "Bytter kode mot token …",
+        "pleaseWait": "Et øyeblikk.",
+        "failed": "Innlogging feilet",
+        "tryAgain": "Tilbake til innlogging"
+    },
+    "session": {
+        "expiringTitle": "Sesjonen utløper snart",
+        "expiringBody": "Sesjonen din utløper om {{minutes}}:{{seconds}}. Logg inn på nytt for å fortsette.",
+        "reauthenticate": "Logg inn på nytt",
+        "dismiss": "Forstått"
+    },
+    "sca": {
+        "title": "Steg-opp-autentisering",
+        "description": "Bekreft handlingen med din SCA-faktor.",
+        "initiating": "Oppretter SCA-sesjon …",
+        "factor": "Faktor: {{type}}",
+        "codeLabel": "6-sifret kode",
+        "verify": "Verifiser",
+        "verifying": "Verifiserer …"
+    },
+    "nav": {
+        "dashboard": "Oversikt",
+        "fraud": "Svindel-saker",
+        "sanctions": "Sanksjons-treff",
+        "accounts": "Kontoer",
+        "audit": "Revisjonslogg",
+        "users": "Operatører",
+        "system": "System"
+    },
+    "fraud": {
+        "queueTitle": "Svindelkø",
+        "openTotal": "Åpne saker",
+        "assignedToMe": "Tildelt meg",
+        "slaBreached": "Over SLA",
+        "score": "Risiko",
+        "amount": "Beløp",
+        "creditor": "Mottaker",
+        "rules": "Regler",
+        "assignee": "Tildelt",
+        "createdAt": "Mottatt",
+        "sla": "SLA",
+        "case": "Sak",
+        "viewCase": "Se sak",
+        "decideCase": "Beslutt",
+        "confirmFraud": "Bekreft svindel",
+        "dismiss": "Avvis sak",
+        "selfAssign": "Ta meg",
+        "unassign": "Avgi",
+        "decideTitle": "Beslutt sak",
+        "decideNotesLabel": "Beslutningsnotater (≥ 50 tegn)",
+        "decideNotesHint": "Notatene blir signert som del av SCA-bindingen.",
+        "confirmedCriteria": "Jeg bekrefter at jeg har vurdert kriteriene.",
+        "decideSubmit": "Bekreft og signer"
+    },
+    "sanctions": {
+        "queueTitle": "Sanksjonstreff",
+        "matchedEntity": "Treff på",
+        "matchedList": "Liste",
+        "matchScore": "Score",
+        "decideTitle": "Beslutt treff",
+        "outcomeConfirmed": "Bekreft sanksjon",
+        "outcomeFalsePositive": "Falsk positiv",
+        "outcomeReleaseForFraud": "Send til svindel-team",
+        "addToFpCache": "Legg til i FP-cache (90 dager)",
+        "listsTitle": "Sanksjonslister",
+        "fpCacheTitle": "Falsk-positiv-cache"
+    },
+    "accounts": {
+        "searchTitle": "Kontosøk",
+        "modeName": "Navn",
+        "modeIban": "IBAN",
+        "modeFnr": "Fødselsnummer",
+        "noResults": "Ingen treff",
+        "freeze": "Frys",
+        "unfreeze": "Slipp frys",
+        "close": "Lukk",
+        "createAccount": "Ny konto",
+        "revealPii": "Avslør PII",
+        "freezeReason": "Årsak",
+        "freezeReference": "Ekstern referanse (valgfri)",
+        "freezeNotes": "Notater (≥ 50 tegn)",
+        "confirmedCriteria": "Jeg bekrefter at kriteriene er oppfylt."
+    },
+    "pii": {
+        "title": "Avslør {{field}}",
+        "justificationLabel": "Forretningsmessig begrunnelse (≥ 20 tegn)",
+        "confirmBusinessNeed": "Jeg bekrefter at jeg har forretningsmessig behov.",
+        "ttlRemaining": "Skjules om {{seconds}} sek.",
+        "extend": "Forleng (+60 s)",
+        "remask": "Skjul nå",
+        "extensionsRemaining": "{{count}} utvidelser igjen",
+        "pendingApproval": "Krever godkjenning fra SUPERVISOR ({{ref}})"
+    },
+    "audit": {
+        "searchTitle": "Søk i revisjonsloggen",
+        "type": "Hendelsestype",
+        "actor": "Aktør",
+        "resource": "Ressurs",
+        "verifyChain": "Verifiser hash-kjede"
+    },
+    "system": {
+        "title": "Systemhelse",
+        "service": "Tjeneste",
+        "status": "Status",
+        "up": "OK",
+        "down": "Nede"
+    },
+    "users": {
+        "title": "Operatør-administrasjon",
+        "create": "Opprett operatør",
+        "suspend": "Suspender",
+        "reactivate": "Reaktivér",
+        "delete": "Slett"
+    }
+}

@@ -1,0 +1,22 @@
+{
+  "name": "jrpay-android-codegen-smoke",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Smoke-test that every JRPay OpenAPI spec produces compilable Kotlin client code via openapi-generator (Kotlin template) + Gradle.",
+  "type": "module",
+  "scripts": {
+    "generate": "node scripts/generate-all.mjs",
+    "compile": "gradle --quiet --no-daemon --console=plain compileKotlin",
+    "smoke": "npm run generate && npm run compile"
+  },
+  "devDependencies": {
+    "@openapitools/openapi-generator-cli": "^2.13.4"
+  },
+  "optionalDependencies": {},
+  "@openapitools/openapi-generator-cli": {
+    "storageDir": "~/.openapi-generator",
+    "generator-cli": {
+      "version": "7.9.0"
+    }
+  }
+}

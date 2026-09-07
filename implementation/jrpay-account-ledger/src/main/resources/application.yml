@@ -1,0 +1,62 @@
+spring:
+  application:
+    name: jrpay-account-ledger
+
+  datasource:
+    url: jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5441}/ledger
+    username: ${DB_USER:ledger}
+    password: ${DB_PASSWORD:ledger}
+    hikari:
+      maximum-pool-size: 10
+      minimum-idle: 5
+      connection-timeout: 5000
+
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    open-in-view: false
+
+  flyway:
+    enabled: true
+
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP:localhost:9092}
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+      acks: all
+      properties:
+        enable.idempotence: true
+
+server:
+  port: 8091
+
+management:
+  server:
+    port: 9091
+  endpoints:
+    web:
+      exposure:
+        include: health,readiness,prometheus
+
+jrpay:
+  ledger:
+    reservation:
+      timeout-seconds: 30
+      scan-interval-ms: 5000
+    jwt:
+      jwks-uri: ${JRPAY_LEDGER_JWKS_URI:http://localhost:8097/oauth2/jwks}
+    identity:
+      base-url: ${JRPAY_LEDGER_IDENTITY_BASE_URL:http://localhost:8097}
+      client-id: ${JRPAY_LEDGER_IDENTITY_CLIENT_ID:jrpay-a1-service}
+      client-secret: ${JRPAY_LEDGER_IDENTITY_CLIENT_SECRET:a1-service-secret}
+    admin:
+      fnr-search-acr-window-seconds: 300
+    audit:
+      pii-separate-topic: true
+    pii:
+      base-ttl: PT60S
+      extension-ttl: PT60S
+      rate-limit-max: 5
+      rate-limit-window: PT1H
+      approval-ttl: PT15M

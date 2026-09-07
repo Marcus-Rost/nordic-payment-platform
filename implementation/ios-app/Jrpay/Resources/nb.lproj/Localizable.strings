@@ -1,0 +1,69 @@
+/* JRPay iOS — Norwegian (Bokmål) strings */
+
+"app_name" = "JRPay";
+
+"login_title" = "Logg inn";
+"login_subtitle" = "Logg inn med BankID for å åpne nettbanken.";
+"login_continue_with_bankid" = "Fortsett med BankID";
+"login_sca_notice" = "Pengetransaksjoner krever BankID-bekreftelse.";
+
+"nav_dashboard" = "Oversikt";
+"nav_payments" = "Betalinger";
+"nav_r2p" = "Forespørsler";
+"nav_more" = "Mer";
+
+"dashboard_title" = "Velkommen tilbake";
+"dashboard_total_balance" = "Total saldo";
+"dashboard_recent_activity" = "Siste aktivitet";
+
+"accounts_title" = "Kontoer";
+"accounts_available" = "Disponibelt";
+"accounts_balance" = "Saldo";
+
+"payments_new_instant" = "Ny straksbetaling";
+"payments_creditor_iban" = "Mottakers IBAN";
+"payments_creditor_name" = "Mottakers navn";
+"payments_amount" = "Beløp";
+"payments_reference" = "Referanse / KID";
+"payments_from_account" = "Fra konto";
+"payments_vop_match" = "Mottaker bekreftet";
+"payments_vop_close" = "Mottakers navn ligner — kontroller før du fortsetter.";
+"payments_vop_mismatch" = "Mottakerens navn passer ikke.";
+"payments_vop_unavailable" = "Kunne ikke verifisere mottaker (offline).";
+"payments_submit_instant" = "Send straksbetaling";
+
+"mandates_title" = "AvtaleGiro-fullmakter";
+"mandates_terminate" = "Avslutt";
+
+"r2p_title" = "Betalingsforespørsler";
+"r2p_accept" = "Godkjenn";
+"r2p_decline" = "Avslå";
+"r2p_no_requests" = "Ingen aktive forespørsler";
+
+"beneficiaries_title" = "Mottakere";
+"beneficiaries_trust" = "Marker som betrodd";
+"beneficiaries_untrust" = "Fjern betrodd-status";
+
+"consents_title" = "Aktive samtykker";
+"consents_revoke" = "Tilbakekall";
+
+"notifications_title" = "Varslinger";
+
+"profile_title" = "Profil";
+
+"privacy_title" = "Personvern og GDPR";
+"privacy_request_export" = "Be om eksport";
+"privacy_request_erasure" = "Be om sletting";
+
+"sca_title" = "Bekreft handlingen";
+"sca_description" = "Bekreft med BankID for å fullføre.";
+
+"biometric_unlock_reason" = "Lås opp JRPay";
+
+"common_loading" = "Laster …";
+"common_cancel" = "Avbryt";
+"common_confirm" = "Bekreft";
+"common_save" = "Lagre";
+"common_logout" = "Logg ut";
+"common_delete" = "Slett";
+"common_no_results" = "Ingen treff";

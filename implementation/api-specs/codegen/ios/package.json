@@ -1,0 +1,12 @@
+{
+  "name": "jrpay-ios-codegen-smoke",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Smoke-test that every JRPay OpenAPI spec produces compilable Swift client code via swift-openapi-generator. Swift toolchain (6+) required to run the compile gate; scaffolding is Node-based.",
+  "type": "module",
+  "scripts": {
+    "scaffold": "node scripts/scaffold.mjs",
+    "compile": "swift build",
+    "smoke": "npm run scaffold && npm run compile"
+  }
+}

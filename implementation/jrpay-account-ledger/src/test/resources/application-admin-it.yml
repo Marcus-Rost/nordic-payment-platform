@@ -1,0 +1,58 @@
+spring:
+  application:
+    name: jrpay-account-ledger-admin-it
+
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    open-in-view: false
+    show-sql: false
+
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+
+  kafka:
+    bootstrap-servers: localhost:9092
+    producer:
+      acks: all
+    # The integration tests stub the publisher; this block stays for
+    # property completeness so the config doesn't fail validation.
+
+server:
+  port: 0
+
+management:
+  server:
+    port: 0
+
+# OAuth2 resource server: in tests we stub the StepUpValidator and
+# inject a custom JwtDecoder that accepts test-issued JWTs locally.
+jrpay:
+  ledger:
+    reservation:
+      timeout-seconds: 30
+      scan-interval-ms: 60000
+    jwt:
+      jwks-uri: http://localhost:8097/oauth2/jwks
+    identity:
+      base-url: http://localhost:8097
+      client-id: jrpay-a1-service
+      client-secret: a1-service-secret
+    admin:
+      fnr-search-acr-window-seconds: 300
+    audit:
+      pii-separate-topic: false
+    pii:
+      base-ttl: PT60S
+      extension-ttl: PT60S
+      rate-limit-max: 5
+      rate-limit-window: PT1H
+      approval-ttl: PT15M
+
+# Logging — keep the integration-test output readable.
+logging:
+  level:
+    root: WARN
+    com.jrpay: INFO
+    org.flywaydb: INFO

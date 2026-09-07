@@ -1,0 +1,14 @@
+spring:
+  datasource:
+    url: jdbc:postgresql://postgres:5432/identity
+    username: jrpay
+    password: jrpay
+  kafka:
+    bootstrap-servers: kafka:29092
+
+server:
+  forward-headers-strategy: framework
+
+jrpay:
+  identity:
+    issuer: ${JRPAY_IDENTITY_ISSUER:http://identity:8097}

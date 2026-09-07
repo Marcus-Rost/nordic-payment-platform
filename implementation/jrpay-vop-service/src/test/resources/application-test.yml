@@ -1,0 +1,12 @@
+spring:
+  application:
+    name: jrpay-vop-service-test
+
+jrpay:
+  vop:
+    matching:
+      match-threshold: 0.95
+      close-match-threshold: 0.85
+    cache:
+      max-entries: 1000
+      ttl: PT1H

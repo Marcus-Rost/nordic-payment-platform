@@ -1,0 +1,437 @@
+openapi: 3.1.0
+info:
+  title: JRPay — Admin GDPR
+  version: 1.0.0
+  description: |
+    Admin-facing GDPR queue + processing surface. Realises UC-G41 —
+    operator processing of customer-initiated GDPR requests (access /
+    erasure / rectification / objection) when automation fails or the
+    request needs human judgement (AML conflict, identity verification).
+
+    Customer-facing endpoints live in `customer-gdpr.yaml`; this spec
+    operates on the same requests from the operator side. Processing
+    invokes the same backend cascade as the self-service flow.
+
+    Step-up SCA is required on `process` and `reject` with dynamic-
+    linking class `admin-action`:
+      - `process` → `action=PROCESS_GDPR`, `resourceType=gdpr-request`.
+      - `reject` → `action=REJECT_GDPR`, `resourceType=gdpr-request`.
+
+    See `shared-schemas.yaml` for enums + Problem envelope + pagination.
+
+servers:
+  - url: "https://admin-api.{env}.jrpay.example"
+    variables: { env: { default: dev } }
+  - url: "http://localhost:8094"
+    description: Local dev (A4 port — GDPR helper)
+
+tags:
+  - name: GDPR-Queue
+    description: UC-G41 §6.1 — queue list / filter
+  - name: GDPR-Detail
+    description: UC-G41 §6.2 — detail + automation log
+  - name: GDPR-Process
+    description: UC-G41 §6.3 / §6.4 — process ACCESS / ERASURE
+  - name: GDPR-Reject
+    description: UC-G41 §6.5 — reject with justification
+  - name: GDPR-Reassign
+    description: UC-G41 §6.2 — reassign to another operator
+
+paths:
+  #############################################################################
+  # Queue
+  #############################################################################
+  /api/v1/admin/gdpr/queue:
+    get:
+      tags: [GDPR-Queue]
+      summary: List GDPR requests in the admin queue (UC-G41 §6.1)
+      description: |
+        Default filter: `status=PENDING,IN_PROGRESS`. Sort defaults to
+        `dueDate,asc` (30-day countdown; GDPR Art. 12(3)).
+      operationId: listGdprQueue
+      security:
+        - OAuth2Admin: [gdpr:execute]
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: array
+            items: { $ref: "shared-schemas.yaml#/components/schemas/GdprRequestStatus" }
+          style: form
+          explode: true
+        - name: type
+          in: query
+          schema:
+            type: array
+            items: { $ref: "shared-schemas.yaml#/components/schemas/GdprRequestType" }
+          style: form
+          explode: true
+        - name: ageBucket
+          in: query
+          schema:
+            type: array
+            items:
+              type: string
+              enum: [D_0_7, D_7_21, D_21_30, OVERDUE]
+          style: form
+          explode: true
+        - name: assignee
+          in: query
+          schema: { type: string }
+        - $ref: "shared-schemas.yaml#/components/parameters/PageNumber"
+        - $ref: "shared-schemas.yaml#/components/parameters/PageSize"
+        - $ref: "shared-schemas.yaml#/components/parameters/SortAsc"
+      responses:
+        "200":
+          description: Paginated requests.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, page, counters]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/GdprRequestSummary" }
+                  page: { $ref: "shared-schemas.yaml#/components/schemas/PageMeta" }
+                  counters:
+                    type: object
+                    required: [openTotal, overdue]
+                    properties:
+                      openTotal: { type: integer, minimum: 0 }
+                      overdue: { type: integer, minimum: 0 }
+
+  #############################################################################
+  # Detail
+  #############################################################################
+  /api/v1/admin/gdpr/{requestId}:
+    get:
+      tags: [GDPR-Detail]
+      summary: GDPR-request detail (UC-G41 §6.2)
+      description: |
+        Request body + masked customer metadata + automation log
+        (what the self-service pipeline tried and why it stopped) +
+        preflight-style blocker list.
+      operationId: getGdprRequest
+      security:
+        - OAuth2Admin: [gdpr:execute]
+      parameters:
+        - $ref: "#/components/parameters/RequestId"
+      responses:
+        "200":
+          description: Request detail.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/GdprRequestDetail" }
+        "404": { $ref: "shared-schemas.yaml#/components/responses/Problem404" }
+
+  /api/v1/admin/gdpr/{requestId}/reassign:
+    post:
+      tags: [GDPR-Reassign]
+      summary: Reassign to another operator (UC-G41 §6.2)
+      operationId: reassignGdprRequest
+      security:
+        - OAuth2Admin: [gdpr:execute]
+      parameters:
+        - $ref: "#/components/parameters/RequestId"
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [assignee]
+              additionalProperties: false
+              properties:
+                assignee:
+                  type: string
+                  description: Operator id, `me`, or `unassigned`.
+                note: { type: string, maxLength: 280 }
+      responses:
+        "200":
+          description: Reassigned.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/GdprRequestDetail" }
+        "404": { $ref: "shared-schemas.yaml#/components/responses/Problem404" }
+
+  #############################################################################
+  # Process
+  #############################################################################
+  /api/v1/admin/gdpr/{requestId}/process:
+    post:
+      tags: [GDPR-Process]
+      summary: Process a GDPR request (UC-G41 §6.3 / §6.4)
+      description: |
+        Operator triggers the backend pipeline. For ACCESS, backend runs
+        the same export pipeline as UC-G24 and delivers the signed-URL
+        link to the customer on completion. For ERASURE, backend runs the
+        cascade (same as UC-G25) — server re-checks all preconditions
+        before starting; if any have regressed since detail render, the
+        call returns `422` with blockers.
+
+        Step-up SCA required with class `admin-action`,
+        `action=PROCESS_GDPR`, `resourceType=gdpr-request`,
+        `resourceId=<requestId>`, `notesHash` over NFC-normalised notes.
+
+        Returns `202` with the updated request; operator polls
+        `GET /admin/gdpr/{requestId}` or subscribes to the customer-side
+        cascade stream (`customer-gdpr.yaml#/erase/{id}/stream`) for
+        ERASURE progress.
+      operationId: processGdprRequest
+      security:
+        - OAuth2Admin: [gdpr:execute]
+      parameters:
+        - $ref: "#/components/parameters/RequestId"
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+        - $ref: "shared-schemas.yaml#/components/parameters/StepUpToken"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/GdprProcessRequest" }
+      responses:
+        "202":
+          description: Processing accepted.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/GdprRequestDetail" }
+        "401":
+          description: urn:problem:step-up-required
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+        "403":
+          description: urn:problem:dynamic-linking-mismatch
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+        "404": { $ref: "shared-schemas.yaml#/components/responses/Problem404" }
+        "422":
+          description: |
+            Preconditions still unmet; `details.blockers[]` lists the
+            reasons (balance, active investigation, active consents).
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+
+  #############################################################################
+  # Reject
+  #############################################################################
+  /api/v1/admin/gdpr/{requestId}/reject:
+    post:
+      tags: [GDPR-Reject]
+      summary: Reject a GDPR request (UC-G41 §6.5)
+      description: |
+        Rejects the request with one of the standard justifications.
+        Customer is notified with a localised explanation (GDPR Art. 12(4)
+        satisfied). Step-up SCA required; class `admin-action`,
+        `action=REJECT_GDPR`.
+      operationId: rejectGdprRequest
+      security:
+        - OAuth2Admin: [gdpr:execute]
+      parameters:
+        - $ref: "#/components/parameters/RequestId"
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+        - $ref: "shared-schemas.yaml#/components/parameters/StepUpToken"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/GdprRejectRequest" }
+      responses:
+        "200":
+          description: Rejected.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/GdprRequestDetail" }
+        "403":
+          description: urn:problem:dynamic-linking-mismatch
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+
+  #############################################################################
+  # Certificate (parity with customer UC-G25 §6.7)
+  #############################################################################
+  /api/v1/admin/gdpr/{requestId}/certificate:
+    get:
+      tags: [GDPR-Detail]
+      summary: Download the completion certificate (admin side)
+      description: |
+        Admin-side download of the customer's completion certificate for
+        audit / handling. 302 to signed URL (1-h TTL per
+        `SIGNED_URL_CONVENTIONS.md`).
+      operationId: getAdminGdprCertificate
+      security:
+        - OAuth2Admin: [gdpr:execute]
+      parameters:
+        - $ref: "#/components/parameters/RequestId"
+      responses:
+        "302":
+          description: Redirect to signed URL.
+          headers:
+            Location:
+              schema: { type: string, format: uri }
+        "404": { $ref: "shared-schemas.yaml#/components/responses/Problem404" }
+        "425":
+          description: urn:problem:export-not-ready — cascade not yet completed.
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+
+components:
+  securitySchemes:
+    OAuth2Admin:
+      $ref: "shared-schemas.yaml#/components/securitySchemes/OAuth2Admin"
+
+  parameters:
+    RequestId:
+      name: requestId
+      in: path
+      required: true
+      schema: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+
+  schemas:
+    GdprRequestSummary:
+      type: object
+      required: [requestId, type, status, submittedAt, dueAt]
+      properties:
+        requestId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+        type: { $ref: "shared-schemas.yaml#/components/schemas/GdprRequestType" }
+        status: { $ref: "shared-schemas.yaml#/components/schemas/GdprRequestStatus" }
+        customerIdMasked:
+          type: string
+          description: Hashed or masked customer id (no raw PII at queue level).
+        submittedAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        dueAt:
+          description: 30-day deadline from submission (GDPR Art. 12(3)).
+          $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant"
+        lateFlag:
+          type: boolean
+          description: |
+            `true` once the deadline has passed (UC-G41 AF-02).
+        automationStatus:
+          type: string
+          enum: [NOT_ATTEMPTED, IN_PROGRESS, FAILED, SUCCEEDED]
+        assignee:
+          type: string
+          nullable: true
+        initiatedBy:
+          type: string
+          enum: [CUSTOMER, SUPPORT_TICKET, OPERATOR]
+
+    GdprRequestDetail:
+      allOf:
+        - $ref: "#/components/schemas/GdprRequestSummary"
+        - type: object
+          required: [requestBody, automationLog, preflight]
+          properties:
+            requestBody:
+              type: object
+              description: |
+                Masked request payload. For ERASURE, the `customerId` and
+                `accountIds` are masked until a PII reveal step (UC-G36)
+                is executed separately.
+              additionalProperties: true
+            automationLog:
+              type: array
+              description: |
+                Step-by-step trace of the self-service cascade's previous
+                attempts, if any. For operator investigation only.
+              items:
+                type: object
+                required: [at, step, status]
+                properties:
+                  at: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+                  step: { type: string }
+                  status:
+                    type: string
+                    enum: [DONE, FAILED, SKIPPED]
+                  errorKey: { type: string }
+                  detail: { type: string, maxLength: 280 }
+            preflight:
+              description: |
+                Same shape as customer-side preflight
+                (`customer-gdpr.yaml#/GdprErasurePreflight`) for ERASURE;
+                minimal for ACCESS (list of artefact sizes, estimated
+                duration).
+              type: object
+              additionalProperties: true
+            processing:
+              description: Present once the operator triggered processing.
+              type: object
+              properties:
+                triggeredBy: { type: string }
+                triggeredAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+                notesSummary: { type: string, maxLength: 140 }
+                notesHash: { type: string, pattern: "^[0-9a-f]{64}$" }
+                legalBasisKey:
+                  type: string
+                  description: i18n key for the legal-basis statement.
+            rejection:
+              description: Present when `status=REJECTED`.
+              type: object
+              properties:
+                justification: { $ref: "#/components/schemas/GdprRejectionJustification" }
+                notesSummary: { type: string, maxLength: 140 }
+                rejectedBy: { type: string }
+                rejectedAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+            certificateAvailable:
+              type: boolean
+
+    GdprProcessRequest:
+      type: object
+      required: [notes, confirmedCriteria]
+      additionalProperties: false
+      properties:
+        notes:
+          type: string
+          minLength: 100
+          maxLength: 4000
+          description: |
+            Operator notes recording the legal basis + operational
+            rationale. ≥ 100 chars server-enforced (UC-G41 §6.4).
+        confirmedCriteria: { type: boolean }
+        legalBasisKey:
+          type: string
+          description: |
+            i18n key for the legal-basis statement recorded on the
+            certificate (e.g. `gdpr.legalBasis.art17.1a`).
+        overrideAutomation:
+          type: boolean
+          description: |
+            When `true`, operator explicitly overrides the automation log
+            and proceeds despite prior failures. Adds an annotation on
+            the audit event.
+          default: false
+        dateRange:
+          description: Optional narrower date window for ACCESS-type.
+          type: object
+          additionalProperties: false
+          properties:
+            from: { $ref: "shared-schemas.yaml#/components/schemas/LocalDate" }
+            to: { $ref: "shared-schemas.yaml#/components/schemas/LocalDate" }
+
+    GdprRejectionJustification:
+      type: string
+      enum:
+        - AML_RETENTION_CONFLICT
+        - ACTIVE_INVESTIGATION
+        - INSUFFICIENT_VERIFICATION
+        - MANIFESTLY_UNFOUNDED
+        - LEGAL_OBLIGATION
+        - OTHER
+
+    GdprRejectRequest:
+      type: object
+      required: [justification, notes, confirmedCriteria]
+      additionalProperties: false
+      properties:
+        justification: { $ref: "#/components/schemas/GdprRejectionJustification" }
+        notes:
+          type: string
+          minLength: 50
+          maxLength: 2000
+        confirmedCriteria: { type: boolean }

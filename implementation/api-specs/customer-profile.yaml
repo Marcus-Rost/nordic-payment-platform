@@ -1,0 +1,533 @@
+openapi: 3.1.0
+info:
+  title: JRPay — Customer Profile
+  version: 1.0.0
+  description: |
+    Customer-facing profile read + edit. Realises UC-G22 (profile view
+    and edit — address, email, phone) and UC-G23 (language preference).
+
+    Immutable fields (name, DOB, fødselsnummer) are upstream-supplied by
+    CDD and surfaced read-only + masked (UC-G22 AF-03). Mutable fields
+    follow the flows:
+
+    - **Address** (UC-G22 §6.1): PATCH with the new address; SCA with
+      dynamic-linking class `profile-change` field=`address`.
+    - **Email** (UC-G22 §6.2): initiate → verification link to new
+      address → confirm → SCA on the initiating device to finalise.
+    - **Phone** (UC-G22 §6.3): initiate → OTP SMS to new number → confirm
+      OTP → SCA.
+    - **Language** (UC-G23): PATCH with the new locale; no SCA.
+
+    Old-address warning emails/SMS are sent automatically by the backend
+    (UC-G22 §6.2 step 4); they have no customer-facing API surface.
+
+    Hosted by A4 (proxies to identity service for credential-adjacent
+    fields). See `shared-schemas.yaml` for enums + Problem envelope.
+
+servers:
+  - url: "https://api.{env}.jrpay.example"
+    variables: { env: { default: dev } }
+  - url: "http://localhost:8094"
+    description: Local dev (A4 port)
+
+tags:
+  - name: Profile
+    description: UC-G22 view + edit; UC-G23 language (low-risk)
+  - name: Profile-Email
+    description: Two-step email change + verification
+  - name: Profile-Phone
+    description: Two-step phone change + OTP verification
+
+paths:
+  #############################################################################
+  # Read + low-risk edit (UC-G22 §6, UC-G23)
+  #############################################################################
+  /api/v1/customer/profile:
+    get:
+      tags: [Profile]
+      summary: Read profile (UC-G22 §6 step 2)
+      operationId: getProfile
+      security:
+        - OAuth2Customer: [profile:read]
+      parameters:
+        - $ref: "shared-schemas.yaml#/components/parameters/AcceptLanguage"
+        - $ref: "shared-schemas.yaml#/components/parameters/TraceParent"
+      responses:
+        "200":
+          description: Profile.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Profile" }
+              examples:
+                typical:
+                  value:
+                    customerId: "c-000123"
+                    name: "Ola Nordmann"
+                    dob: "1990-05-12"
+                    fodselsnummerMasked: "•••••• ••234"
+                    address:
+                      street: "Storgata 12"
+                      postCode: "0155"
+                      city: "Oslo"
+                      country: "NO"
+                    email:
+                      address: "o****@example.com"
+                      verified: true
+                    phone:
+                      number: "+47 •••• ••34"
+                      verified: true
+                    language: "nb-NO"
+                    updatedAt: "2026-03-10T08:15:00.000Z"
+    patch:
+      tags: [Profile]
+      summary: Update address and/or language (UC-G22 §6.1, UC-G23)
+      description: |
+        A single PATCH handles two distinct flows:
+
+        - **Address change (UC-G22 §6.1)** — body includes `address`.
+          Requires SCA with dynamic-linking class `profile-change`,
+          field `address`, `newValueHash` over the canonical JSON of the
+          new address (NFC, sorted keys) per DYNAMIC_LINKING.md. `202`
+          is returned with SCA metadata; on verify the address is
+          committed.
+
+        - **Language change (UC-G23)** — body includes `language`. Low
+          risk; server commits synchronously and returns `200` with the
+          updated profile.
+
+        Both keys together: server processes language immediately and
+        returns a `202` with SCA metadata for the pending address change.
+      operationId: updateProfile
+      security:
+        - OAuth2Customer: [profile:write]
+      parameters:
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+        - $ref: "shared-schemas.yaml#/components/parameters/StepUpToken"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ProfilePatch" }
+      responses:
+        "200":
+          description: Synchronous update (language only, or address after SCA).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Profile" }
+        "202":
+          description: Address change pending SCA.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ProfilePendingSca" }
+        "400": { $ref: "shared-schemas.yaml#/components/responses/Problem400" }
+        "403": { $ref: "shared-schemas.yaml#/components/responses/Problem403" }
+        "422":
+          description: Validation failures (postal code / country scope / …).
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+
+  #############################################################################
+  # Email change (UC-G22 §6.2)
+  #############################################################################
+  /api/v1/customer/profile/email:
+    post:
+      tags: [Profile-Email]
+      summary: Initiate email change (UC-G22 §6.2 step 2)
+      description: |
+        Begins the two-step email-change flow. The customer must supply
+        the current password (identity service verifies) — higher bar
+        than SCA alone because email is a phishing pivot.
+
+        Backend records a pending-change row and dispatches a verification
+        link to the *new* email. The previous address is unchanged until
+        the link is followed + SCA is completed.
+      operationId: changeEmailInitiate
+      security:
+        - OAuth2Customer: [profile:write]
+      parameters:
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/EmailChangeInitiate" }
+      responses:
+        "202":
+          description: Verification email dispatched.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/EmailChangePending" }
+        "401":
+          description: Password incorrect.
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+        "409":
+          description: urn:problem:email-in-use — address bound to another account.
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+        "429": { $ref: "shared-schemas.yaml#/components/responses/Problem429" }
+
+  /api/v1/customer/profile/email/verify:
+    post:
+      tags: [Profile-Email]
+      summary: Complete email change (UC-G22 §6.2 step 3–5)
+      description: |
+        Called by the client after the customer clicks the verification
+        link. The `token` is single-use and short-lived (24-h TTL). On
+        success the backend:
+
+        1. Confirms the address exists as pending-change.
+        2. Triggers SCA with class `profile-change`, field `email`; client
+           returns with a step-up token.
+        3. Commits the new email; emits a warning email to the old
+           address ("Din e-post ble endret…" — UC-G22 §6.2 step 4).
+      operationId: changeEmailComplete
+      security:
+        - OAuth2Customer: [profile:write]
+      parameters:
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+        - $ref: "shared-schemas.yaml#/components/parameters/StepUpToken"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/EmailChangeComplete" }
+      responses:
+        "200":
+          description: Email changed; returns the updated profile.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Profile" }
+        "202":
+          description: Token valid; SCA required.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ProfilePendingSca" }
+        "403":
+          description: urn:problem:dynamic-linking-mismatch
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+        "410":
+          description: urn:problem:signed-url-expired — link expired (UC-G22 AF-02).
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+
+  /api/v1/customer/profile/email/pending:
+    get:
+      tags: [Profile-Email]
+      summary: Inspect an in-progress email change
+      description: |
+        Returns metadata about the currently pending email change (if any)
+        — masked new address, expiry, retry availability. Used by the UI
+        to render the "verify your new email" status card across sessions.
+      operationId: getEmailPending
+      security:
+        - OAuth2Customer: [profile:read]
+      responses:
+        "200":
+          description: Pending change metadata (or empty if none pending).
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [pending]
+                properties:
+                  pending: { type: boolean }
+                  newEmailMasked: { type: string }
+                  expiresAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+                  resendAvailableAt:
+                    description: Instant at which re-send becomes allowed again.
+                    $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant"
+    delete:
+      tags: [Profile-Email]
+      summary: Cancel a pending email change
+      operationId: cancelEmailPending
+      security:
+        - OAuth2Customer: [profile:write]
+      parameters:
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+      responses:
+        "204":
+          description: Cancelled.
+
+  #############################################################################
+  # Phone change (UC-G22 §6.3)
+  #############################################################################
+  /api/v1/customer/profile/phone:
+    post:
+      tags: [Profile-Phone]
+      summary: Initiate phone change (UC-G22 §6.3 step 1)
+      description: |
+        Dispatches an OTP SMS to the new phone. Requires the current
+        password (same rationale as email — phone is an SCA channel via
+        BankID fallback).
+      operationId: changePhoneInitiate
+      security:
+        - OAuth2Customer: [profile:write]
+      parameters:
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PhoneChangeInitiate" }
+      responses:
+        "202":
+          description: OTP dispatched.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PhoneChangePending" }
+        "401":
+          description: Password incorrect.
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+        "409":
+          description: urn:problem:phone-in-use
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+        "429": { $ref: "shared-schemas.yaml#/components/responses/Problem429" }
+    delete:
+      tags: [Profile-Phone]
+      summary: Remove phone (UC-G22 AF-06)
+      description: |
+        Removes the phone number entirely. Cascades to notification
+        preferences (`channels.sms.enabled=false`, `SMS` column locked).
+        SCA required because it affects an SCA channel.
+      operationId: removePhone
+      security:
+        - OAuth2Customer: [profile:write]
+      parameters:
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+        - $ref: "shared-schemas.yaml#/components/parameters/StepUpToken"
+      responses:
+        "200":
+          description: Phone removed; returns updated profile.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Profile" }
+        "202":
+          description: SCA required.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ProfilePendingSca" }
+
+  /api/v1/customer/profile/phone/verify:
+    post:
+      tags: [Profile-Phone]
+      summary: Verify OTP and finalise phone change (UC-G22 §6.3 step 2–3)
+      operationId: changePhoneComplete
+      security:
+        - OAuth2Customer: [profile:write]
+      parameters:
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+        - $ref: "shared-schemas.yaml#/components/parameters/StepUpToken"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PhoneChangeComplete" }
+      responses:
+        "200":
+          description: Phone changed; returns updated profile.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Profile" }
+        "202":
+          description: OTP correct; SCA required.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ProfilePendingSca" }
+        "401":
+          description: OTP incorrect.
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+        "403":
+          description: urn:problem:dynamic-linking-mismatch
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+        "410":
+          description: urn:problem:signed-url-expired — OTP window expired.
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+        "423":
+          description: urn:problem:sca-locked — too many bad OTP attempts.
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+
+components:
+  securitySchemes:
+    OAuth2Customer:
+      $ref: "shared-schemas.yaml#/components/securitySchemes/OAuth2Customer"
+
+  schemas:
+    Profile:
+      type: object
+      required: [customerId, name, dob, fodselsnummerMasked, address, email, language, updatedAt]
+      properties:
+        customerId: { type: string }
+        name:
+          description: Read-only; comes from upstream CDD (UC-G22 AF-03).
+          $ref: "shared-schemas.yaml#/components/schemas/Name"
+        dob:
+          description: Read-only.
+          $ref: "shared-schemas.yaml#/components/schemas/LocalDate"
+        fodselsnummerMasked:
+          type: string
+          description: |
+            Norwegian personal identity number masked to last three digits
+            (UC-G22 §12). Full value only available via UC-G24 GDPR export.
+          example: "•••••• ••234"
+        address:
+          $ref: "#/components/schemas/Address"
+        email:
+          $ref: "#/components/schemas/EmailChannel"
+        phone:
+          $ref: "#/components/schemas/PhoneChannel"
+        language: { $ref: "shared-schemas.yaml#/components/schemas/Locale" }
+        updatedAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+
+    Address:
+      type: object
+      required: [street, postCode, city, country]
+      additionalProperties: false
+      properties:
+        street:
+          type: string
+          maxLength: 140
+        postCode:
+          type: string
+          maxLength: 16
+          description: Format validated per `country` (e.g. NO = 4 digits).
+        city:
+          type: string
+          maxLength: 140
+        country:
+          type: string
+          description: |
+            ISO 3166-1 alpha-2. Allowed set restricted to NO + EU/EEA
+            (UC-G22 §6.1 step 1). Server returns `422` for other values.
+          pattern: "^[A-Z]{2}$"
+          example: "NO"
+
+    EmailChannel:
+      type: object
+      required: [address, verified]
+      properties:
+        address:
+          type: string
+          description: Masked ("o****@example.com"). Full value via GDPR export.
+        verified: { type: boolean }
+
+    PhoneChannel:
+      type: object
+      required: [number, verified]
+      properties:
+        number:
+          type: string
+          description: Masked ("+47 •••• ••34"). Full value via GDPR export.
+        verified: { type: boolean }
+
+    ProfilePatch:
+      type: object
+      additionalProperties: false
+      description: |
+        Partial update. At least one of `address`, `language` is required.
+        Email / phone have their own flows — attempting to include them
+        here returns `400 urn:problem:unknown-field`.
+      properties:
+        address: { $ref: "#/components/schemas/Address" }
+        language: { $ref: "shared-schemas.yaml#/components/schemas/Locale" }
+
+    ProfilePendingSca:
+      type: object
+      required: [field, scaSessionId, dl_hash]
+      properties:
+        field:
+          type: string
+          enum: [address, email, phone]
+        scaSessionId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+        dl_hash:
+          type: string
+          description: SCA dynamic-linking hash (class `profile-change`).
+          pattern: "^[0-9a-f]{64}$"
+        newValueHash:
+          type: string
+          description: Server-computed hash of the new value in NFC (DYNAMIC_LINKING.md).
+          pattern: "^[0-9a-f]{64}$"
+        exempt: { type: boolean }
+        stepUpToken: { type: string }
+        challenge:
+          type: object
+          additionalProperties: true
+
+    EmailChangeInitiate:
+      type: object
+      required: [newEmail, currentPassword]
+      additionalProperties: false
+      properties:
+        newEmail:
+          type: string
+          format: email
+          maxLength: 254
+        currentPassword:
+          type: string
+          format: password
+          minLength: 1
+
+    EmailChangePending:
+      type: object
+      required: [newEmailMasked, expiresAt]
+      properties:
+        newEmailMasked: { type: string }
+        expiresAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+
+    EmailChangeComplete:
+      type: object
+      required: [token]
+      additionalProperties: false
+      properties:
+        token:
+          type: string
+          description: The single-use token from the verification email.
+
+    PhoneChangeInitiate:
+      type: object
+      required: [newPhone, currentPassword]
+      additionalProperties: false
+      properties:
+        newPhone:
+          type: string
+          description: E.164 format — leading `+` and country code.
+          pattern: "^\\+[1-9][0-9]{6,14}$"
+          example: "+4791234567"
+        currentPassword:
+          type: string
+          format: password
+          minLength: 1
+
+    PhoneChangePending:
+      type: object
+      required: [newPhoneMasked, expiresAt]
+      properties:
+        newPhoneMasked: { type: string }
+        expiresAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+
+    PhoneChangeComplete:
+      type: object
+      required: [otp]
+      additionalProperties: false
+      properties:
+        otp:
+          type: string
+          pattern: "^[0-9]{6}$"

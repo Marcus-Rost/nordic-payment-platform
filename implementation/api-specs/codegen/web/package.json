@@ -1,0 +1,16 @@
+{
+  "name": "jrpay-web-codegen-smoke",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Smoke-test that every JRPay OpenAPI spec produces compilable TypeScript types via openapi-typescript + tsc.",
+  "type": "module",
+  "scripts": {
+    "generate": "node scripts/generate-all.mjs",
+    "typecheck": "tsc --noEmit",
+    "smoke": "npm run generate && npm run typecheck"
+  },
+  "devDependencies": {
+    "openapi-typescript": "^7.5.0",
+    "typescript": "^5.6.0"
+  }
+}

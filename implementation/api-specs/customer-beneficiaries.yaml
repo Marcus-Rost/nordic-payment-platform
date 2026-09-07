@@ -1,0 +1,296 @@
+openapi: 3.1.0
+info:
+  title: JRPay — Customer Beneficiaries
+  version: 1.0.0
+  description: |
+    Customer-facing trusted-beneficiary address book. Realises UC-G16.
+
+    Adding a beneficiary requires SCA with dynamic-linking class
+    `beneficiary` bound to `{beneficiaryId, name, iban}`
+    (`gui/architecture/DYNAMIC_LINKING.md`). Editing notes and removing
+    beneficiaries do **not** require SCA (UC-G16 §6.3, §6.4).
+
+    Trusted beneficiaries are later consulted by the payment initiation
+    pipeline so that payments to them can be eligible for the low-value
+    SCA exemption (PSD2 RTS Art. 13). This spec handles only the address-
+    book CRUD; the payment-time exemption logic lives in A4 /
+    `customer-payments.yaml`.
+
+    See `shared-schemas.yaml` for enums + Problem envelope + pagination.
+
+servers:
+  - url: "https://api.{env}.jrpay.example"
+    variables: { env: { default: dev } }
+  - url: "http://localhost:8094"
+    description: Local dev
+
+tags:
+  - name: Beneficiaries
+    description: Trusted beneficiaries — list, add, edit, remove (UC-G16)
+
+paths:
+  /api/v1/customer/beneficiaries:
+    get:
+      tags: [Beneficiaries]
+      summary: List trusted beneficiaries (UC-G16 §6.1)
+      operationId: listBeneficiaries
+      security:
+        - OAuth2Customer: [beneficiaries:manage]
+      parameters:
+        - name: q
+          in: query
+          description: Substring search over `name`, `notes`, and masked IBAN tail digits.
+          schema: { type: string, maxLength: 140 }
+        - $ref: "shared-schemas.yaml#/components/parameters/PageNumber"
+        - $ref: "shared-schemas.yaml#/components/parameters/PageSize"
+        - $ref: "shared-schemas.yaml#/components/parameters/SortAsc"
+      responses:
+        "200":
+          description: Paginated beneficiary summaries.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, page]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/Beneficiary" }
+                  page: { $ref: "shared-schemas.yaml#/components/schemas/PageMeta" }
+              examples:
+                twoEntries:
+                  value:
+                    items:
+                      - beneficiaryId: "be-4567"
+                        name: "Mormor"
+                        ibanMasked: "NO93 •••• •••• 7947"
+                        bankName: "DNB"
+                        lastPaidAt: "2026-02-14T10:15:00.000Z"
+                        totalYtd: "18500.00"
+                        currency: "NOK"
+                        notes: "Sønd. lønn"
+                        createdAt: "2025-09-30T08:00:00.000Z"
+                        status: ACTIVE
+                      - beneficiaryId: "be-4568"
+                        name: "Fiken AS"
+                        ibanMasked: "NO93 •••• •••• 1108"
+                        bankName: "Sparebank 1"
+                        totalYtd: "0.00"
+                        currency: "NOK"
+                        createdAt: "2026-01-20T09:00:00.000Z"
+                        status: ACTIVE
+                    page: { page: 0, size: 25, totalElements: 2, totalPages: 1 }
+    post:
+      tags: [Beneficiaries]
+      summary: Add a trusted beneficiary (UC-G16 §6.2)
+      description: |
+        Creates a beneficiary in `PENDING_SCA`. SCA with class `beneficiary`
+        is required before the entry becomes trusted. `202` is returned with
+        `scaSessionId` and `dl_hash`; on SCA verify the beneficiary is
+        automatically activated.
+
+        VoP is expected to have been run client-side; `vopResult` +
+        `vopPayerOverride` record the outcome for audit. The server re-runs
+        VoP on creation and rejects `NOT_FOUND` regardless of override.
+      operationId: addBeneficiary
+      security:
+        - OAuth2Customer: [beneficiaries:manage]
+      parameters:
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/BeneficiaryAddRequest" }
+      responses:
+        "202":
+          description: Beneficiary created; pending SCA.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/BeneficiaryPendingSca" }
+        "400": { $ref: "shared-schemas.yaml#/components/responses/Problem400" }
+        "409":
+          description: |
+            `urn:problem:duplicate-iban` — existing beneficiary has this IBAN
+            (UC-G16 AF-01). Extension field `details.existingBeneficiaryId`
+            carries the id the UI offers to open instead.
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+        "422":
+          description: |
+            `urn:problem:invalid-iban` (mod-97 fail), `urn:problem:vop-timeout`
+            on repeated NOT_FOUND, or generic business-rule rejection.
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+
+  /api/v1/customer/beneficiaries/{beneficiaryId}:
+    get:
+      tags: [Beneficiaries]
+      summary: Beneficiary detail
+      operationId: getBeneficiary
+      security:
+        - OAuth2Customer: [beneficiaries:manage]
+      parameters:
+        - $ref: "#/components/parameters/BeneficiaryId"
+      responses:
+        "200":
+          description: Beneficiary detail.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/BeneficiaryDetail" }
+        "404": { $ref: "shared-schemas.yaml#/components/responses/Problem404" }
+    patch:
+      tags: [Beneficiaries]
+      summary: Edit notes only (UC-G16 §6.3)
+      description: |
+        Only the `notes` field is mutable. To change name or IBAN, remove
+        the beneficiary and add a new one (UC-G16 §6.3). No SCA required.
+      operationId: updateBeneficiary
+      security:
+        - OAuth2Customer: [beneficiaries:manage]
+      parameters:
+        - $ref: "#/components/parameters/BeneficiaryId"
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/BeneficiaryUpdateRequest" }
+      responses:
+        "200":
+          description: Updated.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/BeneficiaryDetail" }
+        "400": { $ref: "shared-schemas.yaml#/components/responses/Problem400" }
+        "404": { $ref: "shared-schemas.yaml#/components/responses/Problem404" }
+    delete:
+      tags: [Beneficiaries]
+      summary: Remove a beneficiary (UC-G16 §6.4)
+      description: |
+        Removes from the address book. Does **not** cascade to existing
+        mandates, VRP consents, or in-flight payments — customers must
+        revoke those separately (UC-G16 §6.4 warning copy). No SCA.
+      operationId: removeBeneficiary
+      security:
+        - OAuth2Customer: [beneficiaries:manage]
+      parameters:
+        - $ref: "#/components/parameters/BeneficiaryId"
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+      responses:
+        "204":
+          description: Removed.
+        "404": { $ref: "shared-schemas.yaml#/components/responses/Problem404" }
+
+components:
+  securitySchemes:
+    OAuth2Customer:
+      $ref: "shared-schemas.yaml#/components/securitySchemes/OAuth2Customer"
+
+  parameters:
+    BeneficiaryId:
+      name: beneficiaryId
+      in: path
+      required: true
+      schema: { type: string }
+
+  schemas:
+    Beneficiary:
+      type: object
+      required: [beneficiaryId, name, ibanMasked, currency, createdAt, status]
+      properties:
+        beneficiaryId: { type: string }
+        name: { $ref: "shared-schemas.yaml#/components/schemas/Name" }
+        ibanMasked:
+          type: string
+          description: |
+            Masked IBAN ("NO93 •••• •••• 7947"). Full IBAN is only exposed
+            in `BeneficiaryDetail` and only when `GET /{id}` is called —
+            list responses never include the full IBAN (GUI-SEC-09
+            structural enforcement — less surface, less exfiltration risk).
+          example: "NO93 •••• •••• 7947"
+        bankName:
+          type: string
+          description: Derived from the BIC/bank-code prefix.
+        lastPaidAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        totalYtd:
+          description: Sum of payments sent to this beneficiary since 1 Jan.
+          $ref: "shared-schemas.yaml#/components/schemas/MonetaryAmount"
+        currency: { $ref: "shared-schemas.yaml#/components/schemas/Currency" }
+        notes:
+          type: string
+          maxLength: 140
+        createdAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        status:
+          type: string
+          enum: [PENDING_SCA, ACTIVE]
+          description: |
+            `PENDING_SCA` entries are not yet trusted; they still appear in
+            the list with a badge so the customer can complete the SCA.
+
+    BeneficiaryDetail:
+      allOf:
+        - $ref: "#/components/schemas/Beneficiary"
+        - type: object
+          required: [iban]
+          properties:
+            iban:
+              description: Full IBAN. Only returned by `GET /{id}`.
+              $ref: "shared-schemas.yaml#/components/schemas/Iban"
+            bic: { $ref: "shared-schemas.yaml#/components/schemas/Bic" }
+            activatedAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+            paymentsCountYtd:
+              type: integer
+              minimum: 0
+            vopAtCreation:
+              description: VoP result recorded at the moment of creation.
+              $ref: "shared-schemas.yaml#/components/schemas/VoPResult"
+            vopPayerOverrideAtCreation:
+              type: boolean
+
+    BeneficiaryAddRequest:
+      type: object
+      required: [name, iban]
+      additionalProperties: false
+      properties:
+        name: { $ref: "shared-schemas.yaml#/components/schemas/Name" }
+        iban: { $ref: "shared-schemas.yaml#/components/schemas/Iban" }
+        notes:
+          type: string
+          maxLength: 140
+          description: Customer's private note — never merchant-visible.
+        vopResult:
+          description: Client-observed VoP result.
+          $ref: "shared-schemas.yaml#/components/schemas/VoPResult"
+        vopPayerOverride:
+          type: boolean
+          description: |
+            `true` when the customer overrode a NO_MATCH VoP (UC-G16 §6.2
+            step 4). Audited for future fraud analytics.
+
+    BeneficiaryUpdateRequest:
+      type: object
+      additionalProperties: false
+      description: Only `notes` is mutable.
+      properties:
+        notes:
+          type: string
+          maxLength: 140
+
+    BeneficiaryPendingSca:
+      type: object
+      required: [beneficiaryId, scaSessionId, dl_hash]
+      properties:
+        beneficiaryId: { type: string }
+        scaSessionId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+        dl_hash:
+          type: string
+          description: SCA dynamic-linking hash (class `beneficiary`).
+          pattern: "^[0-9a-f]{64}$"
+        exempt: { type: boolean }
+        stepUpToken: { type: string }
+        challenge:
+          type: object
+          additionalProperties: true

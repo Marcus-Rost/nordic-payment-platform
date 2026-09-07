@@ -1,0 +1,14 @@
+spring:
+  datasource:
+    url: jdbc:postgresql://postgres:5432/billpay
+    username: jrpay
+    password: jrpay
+  kafka:
+    bootstrap-servers: kafka:29092
+
+jrpay:
+  billpay:
+    jwt:
+      jwks-uri: http://identity:8097/oauth2/jwks
+    identity:
+      base-url: http://identity:8097

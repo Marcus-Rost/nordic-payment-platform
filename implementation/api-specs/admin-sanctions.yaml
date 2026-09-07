@@ -1,0 +1,609 @@
+openapi: 3.1.0
+info:
+  title: JRPay — Admin Sanctions
+  version: 1.0.0
+  description: |
+    Admin-facing sanctions-hit queue and decision surface. Realises
+    UC-G34 (hit queue, detail, decide CONFIRMED_SANCTION /
+    FALSE_POSITIVE / RELEASE_FOR_FRAUD_REVIEW, and list metadata /
+    refresh).
+
+    Hosted by A5. Every decision requires step-up SCA with dynamic-
+    linking class `admin-action`, `action=DECIDE_SANCTIONS`,
+    `resourceType=hit`, `resourceId=<hitId>`, `decision ∈
+    {CONFIRMED_SANCTION, FALSE_POSITIVE, RELEASE_FOR_FRAUD_REVIEW}`
+    (`DYNAMIC_LINKING.md`).
+
+    SLA is 15 minutes (IPR Art. 5d operational standard). The queue
+    emits a separate SSE stream (`hits/stream`) for live updates.
+
+    See `shared-schemas.yaml` for enums + Problem envelope + pagination.
+
+servers:
+  - url: "https://admin-api.{env}.jrpay.example"
+    variables: { env: { default: dev } }
+  - url: "http://localhost:8095"
+    description: Local dev (A5 port)
+
+tags:
+  - name: Sanctions-Queue
+    description: UC-G34 — list / detail
+  - name: Sanctions-Decide
+    description: UC-G34 §6.3 / §6.4 / §6.5
+  - name: Sanctions-List
+    description: UC-G34 §6 step 3 — list version metadata + refresh
+  - name: Sanctions-FpCache
+    description: Local false-positive cache inspection
+  - name: Sanctions-Stream
+    description: SSE for live updates per SSE_CONVENTIONS.md
+
+paths:
+  #############################################################################
+  # Queue
+  #############################################################################
+  /api/v1/admin/sanctions/hits:
+    get:
+      tags: [Sanctions-Queue]
+      summary: List sanctions hits (UC-G34 §6.1)
+      operationId: listSanctionsHits
+      security:
+        - OAuth2Admin: [sanctions:read]
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: array
+            items: { $ref: "shared-schemas.yaml#/components/schemas/SanctionsHitDecision" }
+          style: form
+          explode: true
+        - name: list
+          in: query
+          description: Filter by matched sanctions list id (e.g. `EU-CONS`, `OFAC-SDN`).
+          schema: { type: string }
+        - name: matchedEntity
+          in: query
+          description: Substring against matched entity name (case-insensitive).
+          schema: { type: string }
+        - name: assignee
+          in: query
+          schema: { type: string }
+        - name: from
+          in: query
+          schema: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        - name: to
+          in: query
+          schema: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        - $ref: "shared-schemas.yaml#/components/parameters/PageNumber"
+        - $ref: "shared-schemas.yaml#/components/parameters/PageSize"
+        - $ref: "shared-schemas.yaml#/components/parameters/SortAsc"
+      responses:
+        "200":
+          description: Paginated hits.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, page, counters]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/SanctionsHitSummary" }
+                  page: { $ref: "shared-schemas.yaml#/components/schemas/PageMeta" }
+                  counters:
+                    type: object
+                    required: [openTotal, slaBreached]
+                    properties:
+                      openTotal: { type: integer, minimum: 0 }
+                      slaBreached: { type: integer, minimum: 0 }
+        "401": { $ref: "shared-schemas.yaml#/components/responses/Problem401" }
+        "403": { $ref: "shared-schemas.yaml#/components/responses/Problem403" }
+
+  /api/v1/admin/sanctions/hits/{hitId}:
+    get:
+      tags: [Sanctions-Queue]
+      summary: Hit detail with matched-entity record + prior dealings (UC-G34 §6.2)
+      operationId: getSanctionsHit
+      security:
+        - OAuth2Admin: [sanctions:read]
+      parameters:
+        - $ref: "#/components/parameters/HitId"
+      responses:
+        "200":
+          description: Hit detail.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SanctionsHitDetail" }
+        "404": { $ref: "shared-schemas.yaml#/components/responses/Problem404" }
+
+  #############################################################################
+  # Decide (UC-G34 §6.3 / §6.4 / §6.5)
+  #############################################################################
+  /api/v1/admin/sanctions/hits/{hitId}/decide:
+    post:
+      tags: [Sanctions-Decide]
+      summary: Decide a sanctions hit (UC-G34 §6.3 / §6.4 / §6.5)
+      description: |
+        Cascading effects:
+
+        - `CONFIRMED_SANCTION` → `account.freeze-commands
+          reason=SANCTIONS_HOLD`, payment REJECTED, FIU report stub queued.
+        - `FALSE_POSITIVE` → optional FP-cache entry (90-day TTL), held
+          payment released, customer notified of success.
+        - `RELEASE_FOR_FRAUD_REVIEW` → new fraud case created; hit closed.
+
+        Step-up SCA required; `Step-Up-Token.dl_hash` must match class
+        `admin-action` inputs `{action:"DECIDE_SANCTIONS",
+        resourceType:"hit", resourceId:<hitId>, decision, notesHash}`.
+        Notes are required (≥ 50 chars).
+
+        Customer-facing copy for CONFIRMED_SANCTION follows the
+        anti-tipping-off discipline (UC-G20): generic regulatory language,
+        never the word "sanction".
+      operationId: decideSanctionsHit
+      security:
+        - OAuth2Admin: [sanctions:manage]
+      parameters:
+        - $ref: "#/components/parameters/HitId"
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+        - $ref: "shared-schemas.yaml#/components/parameters/StepUpToken"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SanctionsDecideRequest" }
+      responses:
+        "200":
+          description: Decision applied.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SanctionsDecideAck" }
+        "401":
+          description: urn:problem:step-up-required
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+        "403":
+          description: urn:problem:dynamic-linking-mismatch
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+        "404": { $ref: "shared-schemas.yaml#/components/responses/Problem404" }
+        "409":
+          description: urn:problem:hit-already-decided
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+        "422":
+          description: Notes too short, criteria missing.
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+
+  #############################################################################
+  # List metadata + refresh (UC-G34 AF-02, AF-05)
+  #############################################################################
+  /api/v1/admin/sanctions/lists:
+    get:
+      tags: [Sanctions-List]
+      summary: Sanctions list metadata (UC-G34 §6 step 3)
+      description: |
+        Returns version metadata for each list backing the screening. A
+        banner appears (AF-02) when `staleHours > 24`.
+      operationId: listSanctionsLists
+      security:
+        - OAuth2Admin: [sanctions:read]
+      responses:
+        "200":
+          description: Lists.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/SanctionsListMeta" }
+
+  /api/v1/admin/sanctions/lists/refresh:
+    post:
+      tags: [Sanctions-List]
+      summary: Force list refresh (UC-G34 AF-05)
+      description: |
+        Triggers the A5 list-refresh job. Step-up SCA required
+        (`action=DECIDE_SANCTIONS`, `resourceType=audit`,
+        `resourceId=list-refresh`). Returns the job's tracking id.
+        Subsequent status pollable via `GET /lists/refresh/{runId}`.
+      operationId: refreshSanctionsLists
+      security:
+        - OAuth2Admin: [sanctions:manage]
+      parameters:
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+        - $ref: "shared-schemas.yaml#/components/parameters/StepUpToken"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                listIds:
+                  type: array
+                  description: If set, refresh only these lists. Otherwise, all.
+                  items: { type: string }
+      responses:
+        "202":
+          description: Refresh accepted.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SanctionsListRefreshJob" }
+        "403":
+          description: urn:problem:dynamic-linking-mismatch
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+        "429": { $ref: "shared-schemas.yaml#/components/responses/Problem429" }
+
+  /api/v1/admin/sanctions/lists/refresh/{runId}:
+    get:
+      tags: [Sanctions-List]
+      summary: Poll a refresh job
+      operationId: getSanctionsListRefresh
+      security:
+        - OAuth2Admin: [sanctions:read]
+      parameters:
+        - name: runId
+          in: path
+          required: true
+          schema: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+      responses:
+        "200":
+          description: Job state.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SanctionsListRefreshJob" }
+        "404": { $ref: "shared-schemas.yaml#/components/responses/Problem404" }
+
+  #############################################################################
+  # False-positive cache inspection
+  #############################################################################
+  /api/v1/admin/sanctions/fp-cache:
+    get:
+      tags: [Sanctions-FpCache]
+      summary: List active false-positive cache entries
+      description: |
+        Inspect entries added via UC-G34 §6.4. Entries auto-expire after
+        90 days; re-addition refreshes the TTL.
+      operationId: listFpCache
+      security:
+        - OAuth2Admin: [sanctions:read]
+      parameters:
+        - name: matchedEntity
+          in: query
+          schema: { type: string }
+        - $ref: "shared-schemas.yaml#/components/parameters/PageNumber"
+        - $ref: "shared-schemas.yaml#/components/parameters/PageSize"
+      responses:
+        "200":
+          description: Paginated cache entries.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, page]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/FpCacheEntry" }
+                  page: { $ref: "shared-schemas.yaml#/components/schemas/PageMeta" }
+
+  /api/v1/admin/sanctions/fp-cache/{entryId}:
+    delete:
+      tags: [Sanctions-FpCache]
+      summary: Remove an FP cache entry (compliance intervention)
+      description: |
+        Requires SCA. Removing an FP entry causes the corresponding
+        beneficiary to be rescreened on next payment. Used when the list
+        content changes to genuinely cover a previously whitelisted entity.
+      operationId: removeFpCacheEntry
+      security:
+        - OAuth2Admin: [sanctions:manage]
+      parameters:
+        - name: entryId
+          in: path
+          required: true
+          schema: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+        - $ref: "shared-schemas.yaml#/components/parameters/StepUpToken"
+      responses:
+        "204":
+          description: Removed.
+        "404": { $ref: "shared-schemas.yaml#/components/responses/Problem404" }
+        "403":
+          description: urn:problem:dynamic-linking-mismatch
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+
+  #############################################################################
+  # SSE
+  #############################################################################
+  /api/v1/admin/sanctions/hits/stream-token:
+    post:
+      tags: [Sanctions-Stream]
+      summary: One-time SSE stream token
+      operationId: sanctionsStreamToken
+      security:
+        - OAuth2Admin: [sanctions:read]
+      parameters:
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+      responses:
+        "200":
+          description: Stream token.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [streamToken, expiresIn]
+                properties:
+                  streamToken: { type: string }
+                  expiresIn: { type: integer, example: 300 }
+
+  /api/v1/admin/sanctions/hits/stream:
+    get:
+      tags: [Sanctions-Stream]
+      summary: Live sanctions SSE
+      description: |
+        Events: `hit.created`, `hit.decided`, `sla.breached`. Heartbeat
+        15 s, single-use token.
+      operationId: sanctionsStream
+      parameters:
+        - name: token
+          in: query
+          required: true
+          schema: { type: string }
+        - name: Last-Event-ID
+          in: header
+          required: false
+          schema: { type: string }
+      responses:
+        "200":
+          description: text/event-stream
+          content:
+            text/event-stream:
+              schema: { type: string }
+
+components:
+  securitySchemes:
+    OAuth2Admin:
+      $ref: "shared-schemas.yaml#/components/securitySchemes/OAuth2Admin"
+
+  parameters:
+    HitId:
+      name: hitId
+      in: path
+      required: true
+      schema: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+
+  schemas:
+    SanctionsHitSummary:
+      type: object
+      required:
+        - hitId
+        - status
+        - matchedEntityName
+        - matchedList
+        - score
+        - createdAt
+        - slaDeadline
+      properties:
+        hitId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+        status: { $ref: "shared-schemas.yaml#/components/schemas/SanctionsHitDecision" }
+        paymentId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+        debtorIbanMasked: { type: string }
+        beneficiaryNameOnTransaction:
+          type: string
+          description: |
+            Name as it appeared on the payment. Surfaced here because the
+            hit is inherently about this name; this is not PII-reveal — the
+            operator already sees it when looking at the hit.
+        matchedEntityName: { type: string }
+        matchedList:
+          type: string
+          description: "List id, e.g. `EU-CONS`, `UN-SC`, `NO-NAT`, `OFAC-SDN`."
+        score:
+          description: Jaro-Winkler similarity.
+          type: number
+          minimum: 0
+          maximum: 1
+        assignee:
+          type: string
+          nullable: true
+        createdAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        slaDeadline: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        slaBreached: { type: boolean }
+
+    SanctionsHitDetail:
+      allOf:
+        - $ref: "#/components/schemas/SanctionsHitSummary"
+        - type: object
+          required: [transaction, matchedEntity, scoreBreakdown]
+          properties:
+            transaction:
+              type: object
+              required: [paymentId, amount, currency, creditorIban, creditorName]
+              properties:
+                paymentId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+                amount: { $ref: "shared-schemas.yaml#/components/schemas/MonetaryAmount" }
+                currency: { $ref: "shared-schemas.yaml#/components/schemas/Currency" }
+                reference: { type: string }
+                creditorIban: { $ref: "shared-schemas.yaml#/components/schemas/Iban" }
+                creditorName: { $ref: "shared-schemas.yaml#/components/schemas/Name" }
+                initiatedAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+            matchedEntity:
+              type: object
+              required: [name, listId]
+              properties:
+                name: { type: string }
+                aliases:
+                  type: array
+                  items: { type: string }
+                dob: { $ref: "shared-schemas.yaml#/components/schemas/LocalDate" }
+                country: { type: string, pattern: "^[A-Z]{2}$" }
+                listId: { type: string }
+                listingDate: { $ref: "shared-schemas.yaml#/components/schemas/LocalDate" }
+                regulator: { type: string }
+                resolutionRef:
+                  type: string
+                  description: UNSC/EU/OFAC resolution reference.
+                legalBasisExcerpt:
+                  type: string
+                  maxLength: 2000
+                  description: Excerpt of the listing resolution text (read-only).
+            scoreBreakdown:
+              type: object
+              description: Per-alias scoring used by the matcher.
+              properties:
+                matchedAliases:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      alias: { type: string }
+                      score: { type: number, minimum: 0, maximum: 1 }
+                threshold:
+                  type: number
+                  description: Alert threshold that caused hit creation (e.g. 0.85).
+            priorDealings:
+              type: array
+              description: |
+                Past transactions between this debtor and the matched
+                entity or its aliases. Each item deep-links to UC-G35's
+                transaction detail (admin side).
+              items:
+                type: object
+                required: [transactionId, at, amount, currency, outcome]
+                properties:
+                  transactionId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+                  at: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+                  amount: { $ref: "shared-schemas.yaml#/components/schemas/MonetaryAmount" }
+                  currency: { $ref: "shared-schemas.yaml#/components/schemas/Currency" }
+                  outcome:
+                    $ref: "shared-schemas.yaml#/components/schemas/PaymentStatus"
+            decision:
+              description: Present once decided.
+              type: object
+              properties:
+                decision:
+                  $ref: "shared-schemas.yaml#/components/schemas/SanctionsHitDecision"
+                decidedBy: { type: string }
+                decidedAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+                notesSummary: { type: string, maxLength: 140 }
+                notesHash: { type: string, pattern: "^[0-9a-f]{64}$" }
+                fpCacheEntryId:
+                  description: Present when `decision=FALSE_POSITIVE` with cache add.
+                  $ref: "shared-schemas.yaml#/components/schemas/Uuid"
+                fraudCaseId:
+                  description: Present when `decision=RELEASE_FOR_FRAUD_REVIEW`.
+                  $ref: "shared-schemas.yaml#/components/schemas/Uuid"
+
+    SanctionsDecideRequest:
+      type: object
+      required: [decision, notes, confirmedCriteria]
+      additionalProperties: false
+      properties:
+        decision: { $ref: "shared-schemas.yaml#/components/schemas/SanctionsHitDecision" }
+        notes:
+          type: string
+          minLength: 50
+          maxLength: 2000
+        confirmedCriteria:
+          type: boolean
+          description: Mandatory checkbox value.
+        addToFpCache:
+          type: boolean
+          description: |
+            Only honoured when `decision=FALSE_POSITIVE`. When `true`,
+            server adds an entry with 90-day TTL.
+          default: true
+
+    SanctionsDecideAck:
+      type: object
+      required: [hitId, decision, decidedAt]
+      properties:
+        hitId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+        decision: { $ref: "shared-schemas.yaml#/components/schemas/SanctionsHitDecision" }
+        decidedAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        decidedBy: { type: string }
+        affectedPayments:
+          type: array
+          items: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+        accountFrozen:
+          description: Present when `decision=CONFIRMED_SANCTION`.
+          type: object
+          properties:
+            accountId: { type: string }
+            freezeReference: { type: string }
+        fpCacheEntryId:
+          $ref: "shared-schemas.yaml#/components/schemas/Uuid"
+        fraudCaseId:
+          description: Set when `decision=RELEASE_FOR_FRAUD_REVIEW`.
+          $ref: "shared-schemas.yaml#/components/schemas/Uuid"
+        fiuReportQueuedRef:
+          description: Present when `decision=CONFIRMED_SANCTION`.
+          type: string
+
+    SanctionsListMeta:
+      type: object
+      required: [listId, displayName, version, lastUpdatedAt, entriesCount]
+      properties:
+        listId: { type: string }
+        displayName: { type: string }
+        version: { type: string }
+        lastUpdatedAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        entriesCount: { type: integer, minimum: 0 }
+        staleHours:
+          type: integer
+          minimum: 0
+        sourceUrl:
+          type: string
+          format: uri
+          description: Upstream authority URL.
+
+    SanctionsListRefreshJob:
+      type: object
+      required: [runId, status, startedAt]
+      properties:
+        runId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+        status:
+          type: string
+          enum: [QUEUED, RUNNING, COMPLETED, FAILED]
+        startedAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        completedAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        listIds:
+          type: array
+          items: { type: string }
+        entriesAdded: { type: integer, minimum: 0 }
+        entriesRemoved: { type: integer, minimum: 0 }
+        failureReason: { type: string }
+
+    FpCacheEntry:
+      type: object
+      required: [entryId, beneficiaryHash, matchedEntityId, createdAt, expiresAt]
+      properties:
+        entryId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+        beneficiaryHash:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+          description: SHA-256 over the beneficiary name + IBAN (anonymised key).
+        matchedEntityId: { type: string }
+        matchedEntityName: { type: string }
+        matchedList: { type: string }
+        createdAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        expiresAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        createdBy: { type: string }
+        lastUsedAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        useCount:
+          type: integer
+          minimum: 0

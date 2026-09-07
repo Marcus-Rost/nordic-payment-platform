@@ -1,0 +1,23 @@
+spring:
+  application:
+    name: jrpay-vop-service
+
+server:
+  port: 8096
+
+management:
+  server:
+    port: 9096
+  endpoints:
+    web:
+      exposure:
+        include: health,readiness,prometheus
+
+jrpay:
+  vop:
+    matching:
+      match-threshold: 0.95
+      close-match-threshold: 0.85
+    cache:
+      max-entries: 100000
+      ttl: PT1H

@@ -1,0 +1,714 @@
+openapi: 3.1.0
+info:
+  title: JRPay Identity Service
+  version: 1.0.0
+  description: |
+    OAuth2 Authorization Server + SCA orchestration + password-reset + privacy-notice.
+
+    Covers identity-service surface for customer GUIs (client-web, client-ios,
+    client-android), admin GUI (admin-web), and TPP integrations (BerlinGroup
+    consent grant flow). Hosted as the separate `jrpay-identity-service`
+    module per PROJECT_DECISIONS D2.
+
+    Spec-authoritative companion documents:
+    - `gui/architecture/DYNAMIC_LINKING.md` — SCA hash canonical form
+    - `gui/architecture/PROBLEM_TYPES.md` — error taxonomy
+    - `gui/architecture/SSE_CONVENTIONS.md` — session SSE stream
+    - `gui/architecture/SHARED_ENUMS.md` — enum values
+  contact:
+    name: JRPay Platform Team
+
+servers:
+  - url: "https://identity.{env}.jrpay.example"
+    variables:
+      env: { default: dev, enum: [dev, stg, prod] }
+  - url: "http://localhost:8097"
+    description: Local dev via docker-compose
+
+tags:
+  - name: OAuth2
+    description: RFC 6749 + RFC 7636 PKCE + OpenID Connect discovery
+  - name: SCA
+    description: PSD2 RTS Art. 5 dynamic-linking SCA orchestration (DYNAMIC_LINKING.md)
+  - name: PasswordReset
+    description: UC-G44 one-time signed link flow
+  - name: PrivacyNotice
+    description: UC-G45 Art. 13/14 notice delivery + acceptance
+  - name: Session
+    description: Session stream, concurrent-session controls, logout
+  - name: Discovery
+    description: OIDC metadata + JWKS
+
+paths:
+  #############################################################################
+  # OAuth2 + OIDC
+  #############################################################################
+  /oauth2/authorize:
+    get:
+      tags: [OAuth2]
+      summary: Authorization endpoint (Auth Code + PKCE)
+      description: |
+        Entry point for OAuth2 Authorization Code + PKCE per RFC 7636. Invoked
+        by a browser redirect or (for mobile) from ASWebAuthenticationSession /
+        Custom Tab. Host checks `client_id` + exact `redirect_uri` match per
+        registered client; runs login and SCA if required; issues an
+        authorization code bound to the PKCE code_challenge.
+      operationId: oauth2Authorize
+      parameters:
+        - name: response_type
+          in: query
+          required: true
+          schema: { type: string, enum: [code] }
+        - name: client_id
+          in: query
+          required: true
+          schema: { type: string }
+        - name: redirect_uri
+          in: query
+          required: true
+          schema: { type: string, format: uri }
+        - name: scope
+          in: query
+          required: true
+          schema: { type: string }
+          description: Space-separated scopes; subset allowed for the client.
+        - name: state
+          in: query
+          required: true
+          schema: { type: string, minLength: 22 }
+          description: ≥ 128 bits entropy. Opaque; echoed back on redirect.
+        - name: nonce
+          in: query
+          required: false
+          schema: { type: string, minLength: 22 }
+        - name: code_challenge
+          in: query
+          required: true
+          schema: { type: string, minLength: 43, maxLength: 128 }
+        - name: code_challenge_method
+          in: query
+          required: true
+          schema: { type: string, enum: [S256] }
+        - name: acr_values
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [loa3, loa3-admin]
+        - name: prompt
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [login, consent, select_account, none]
+      responses:
+        "302":
+          description: Redirect to `redirect_uri` with `?code=...&state=...`.
+          headers:
+            Location:
+              schema: { type: string, format: uri }
+
+  /oauth2/token:
+    post:
+      tags: [OAuth2]
+      summary: Token endpoint (code exchange + refresh)
+      description: |
+        Accepts `grant_type=authorization_code` (with `code_verifier`) or
+        `grant_type=refresh_token`. Response carries access_token (JWT RS256),
+        refresh_token (opaque, rotated), and id_token when `openid` scope
+        requested. Web clients receive refresh_token via `Set-Cookie` with
+        `HttpOnly; Secure; SameSite=Strict; Path=/oauth2/`. Mobile clients
+        receive refresh_token in the JSON body.
+      operationId: oauth2Token
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              properties:
+                grant_type:
+                  type: string
+                  enum: [authorization_code, refresh_token]
+                code: { type: string }
+                code_verifier: { type: string }
+                refresh_token: { type: string }
+                client_id: { type: string }
+                redirect_uri: { type: string, format: uri }
+      responses:
+        "200":
+          description: Token issued.
+          headers:
+            Set-Cookie:
+              description: |
+                Only for web clients. Present only when the client is web
+                (per `client_id` registration); mobile clients read the
+                refresh_token from the JSON body.
+              schema: { type: string }
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [access_token, token_type, expires_in]
+                properties:
+                  access_token: { type: string }
+                  token_type: { type: string, enum: [Bearer] }
+                  expires_in: { type: integer, example: 900 }
+                  refresh_token: { type: string }
+                  id_token: { type: string }
+                  scope: { type: string }
+        "400": { $ref: "shared-schemas.yaml#/components/responses/Problem400" }
+        "401": { $ref: "shared-schemas.yaml#/components/responses/Problem401" }
+        "429": { $ref: "shared-schemas.yaml#/components/responses/Problem429" }
+
+  /oauth2/revoke:
+    post:
+      tags: [OAuth2]
+      summary: Token revocation (RFC 7009)
+      description: |
+        Revokes a refresh token. UC-G53 §6.1 single-device logout: client sends
+        the refresh token; server marks revoked and propagates to the
+        revocation cache. A 200 is returned even if the token is already
+        invalid (RFC 7009 §2.2 specifies unconditional 200 on refresh token).
+      operationId: oauth2Revoke
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              required: [token]
+              properties:
+                token: { type: string }
+                token_type_hint:
+                  type: string
+                  enum: [refresh_token, access_token]
+      responses:
+        "200":
+          description: Revocation accepted.
+
+  /oauth2/revoke-all:
+    post:
+      tags: [OAuth2]
+      summary: Revoke all sessions (logout-everywhere)
+      description: |
+        UC-G53 §6.2. Revokes every refresh token for the authenticated user
+        except (if `preserve-current=true`) the one in the request. SCA
+        required (high-risk action); client supplies a step-up token.
+      operationId: oauth2RevokeAll
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: preserve-current
+          in: query
+          required: false
+          schema: { type: boolean, default: true }
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+        - $ref: "shared-schemas.yaml#/components/parameters/StepUpToken"
+      responses:
+        "204":
+          description: All-but-current tokens revoked.
+        "401": { $ref: "shared-schemas.yaml#/components/responses/Problem401" }
+
+  /oauth2/introspect:
+    post:
+      tags: [OAuth2]
+      summary: Token introspection (RFC 7662)
+      description: |
+        Resource-server-facing. Not exposed to GUIs in MVP. Backend services
+        use this for tokens that lack a `dl_hash` claim but require freshness
+        verification (e.g., right after a revoke-all).
+      operationId: oauth2Introspect
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              required: [token]
+              properties:
+                token: { type: string }
+                token_type_hint:
+                  type: string
+                  enum: [access_token, refresh_token]
+      responses:
+        "200":
+          description: Introspection response.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [active]
+                properties:
+                  active: { type: boolean }
+                  scope: { type: string }
+                  client_id: { type: string }
+                  sub: { type: string }
+                  aud: { type: string }
+                  exp: { type: integer }
+                  iat: { type: integer }
+                  sid: { type: string }
+                  dl_hash: { type: string }
+                  acr:
+                    $ref: "shared-schemas.yaml#/components/schemas/ScaAcrLevel"
+
+  /oauth2/password-reset/request:
+    post:
+      tags: [OAuth2, PasswordReset]
+      summary: Initiate password reset (UC-G44 §6 step 4)
+      description: |
+        Returns 202 regardless of whether the identifier resolves (enumeration
+        defence). On resolution, identity service generates a one-time signed
+        token (30-min TTL) and sends a reset link via email.
+      operationId: passwordResetRequest
+      parameters:
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [identifier]
+              properties:
+                identifier:
+                  type: string
+                  description: Email, fødselsnummer (customer), or username (operator).
+                audience:
+                  type: string
+                  enum: [customer, admin]
+                  default: customer
+      responses:
+        "202":
+          description: |
+            Always returned. Client shows neutral "if the account exists, we
+            will email…" copy.
+        "429": { $ref: "shared-schemas.yaml#/components/responses/Problem429" }
+
+  /oauth2/password-reset/verify:
+    get:
+      tags: [OAuth2, PasswordReset]
+      summary: Validate reset token (UC-G44 §6 step 8)
+      operationId: passwordResetVerify
+      parameters:
+        - name: t
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Token valid. Client renders the new-password form.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  audience:
+                    type: string
+                    enum: [customer, admin]
+                  identifierMasked:
+                    type: string
+                    description: e.g. `o****@example.com` — for UI confirmation.
+        "410":
+          description: urn:problem:signed-url-expired
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+
+  /oauth2/password-reset/complete:
+    post:
+      tags: [OAuth2, PasswordReset]
+      summary: Set new password (UC-G44 §6 step 10)
+      operationId: passwordResetComplete
+      parameters:
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token, newPassword]
+              properties:
+                token: { type: string }
+                newPassword: { type: string, minLength: 10, maxLength: 128 }
+      responses:
+        "204":
+          description: Password updated; all refresh tokens revoked.
+        "410": { $ref: "shared-schemas.yaml#/components/responses/Problem410" }
+        "422": { $ref: "shared-schemas.yaml#/components/responses/Problem422" }
+
+  /.well-known/openid-configuration:
+    get:
+      tags: [Discovery]
+      summary: OIDC discovery (IDS-F10)
+      operationId: oidcDiscovery
+      responses:
+        "200":
+          description: OIDC discovery document.
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+
+  /.well-known/jwks.json:
+    get:
+      tags: [Discovery]
+      summary: JSON Web Key Set (IDS-F10)
+      operationId: jwks
+      responses:
+        "200":
+          description: Current signing keys. Rotates periodically.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [keys]
+                properties:
+                  keys:
+                    type: array
+                    items: { type: object, additionalProperties: true }
+
+  #############################################################################
+  # SCA endpoints (UC-G51)
+  #############################################################################
+  /sca/start:
+    post:
+      tags: [SCA]
+      summary: Start SCA with dynamic-linking inputs
+      description: |
+        UC-G51 §6 step 2. Server computes `dl_hash` over the canonical JSON of
+        the inputs (per DYNAMIC_LINKING.md) and returns the session id, the
+        hash (for client-side verification), and the challenge metadata.
+      operationId: scaStart
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [inputs]
+              properties:
+                inputs:
+                  $ref: "shared-schemas.yaml#/components/schemas/DynamicLinkingInput"
+                factorHint:
+                  $ref: "shared-schemas.yaml#/components/schemas/ScaFactorType"
+      responses:
+        "200":
+          description: SCA session created.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [scaSessionId, dl_hash, challenge]
+                properties:
+                  scaSessionId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+                  dl_hash:
+                    type: string
+                    pattern: "^[0-9a-f]{64}$"
+                  challenge:
+                    type: object
+                    required: [type]
+                    properties:
+                      type: { $ref: "shared-schemas.yaml#/components/schemas/ScaFactorType" }
+                      metadata:
+                        type: object
+                        additionalProperties: true
+                  exempt:
+                    type: boolean
+                    description: |
+                      True if PSD2 exemption applies (UC-G51 AF-05). In that
+                      case, no user interaction is needed; client receives a
+                      step-up token immediately.
+                  stepUpToken: { type: string }
+        "400": { $ref: "shared-schemas.yaml#/components/responses/Problem400" }
+        "401": { $ref: "shared-schemas.yaml#/components/responses/Problem401" }
+
+  /sca/{scaSessionId}/verify:
+    post:
+      tags: [SCA]
+      summary: Verify SCA response
+      description: |
+        Submits the SCA proof for the given session. On success the server
+        returns a short-lived step-up token whose `dl_hash` claim binds
+        the subsequent resource call to the dynamic-linking inputs
+        supplied to `/sca/start` (UC-G51 §6 steps 7–10).
+
+        Idempotent by `(scaSessionId, Idempotency-Key)`: re-posting the
+        same proof with the same key returns the original step-up token
+        until the session is consumed by the resource call.
+      operationId: scaVerify
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: scaSessionId
+          in: path
+          required: true
+          schema: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [proof]
+              properties:
+                proof:
+                  oneOf:
+                    - type: object
+                      required: [type, code]
+                      properties:
+                        type: { type: string, enum: [TOTP] }
+                        code: { type: string, pattern: "^[0-9]{6}$" }
+                    - type: object
+                      required: [type, assertion]
+                      properties:
+                        type: { type: string, enum: [BANKID_SIMULATED, BANKID_REAL] }
+                        assertion: { type: string }
+      responses:
+        "200":
+          description: SCA verified.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, stepUpToken]
+                properties:
+                  status: { type: string, enum: [VERIFIED] }
+                  stepUpToken:
+                    type: string
+                    description: Short-lived JWT carrying `dl_hash` claim.
+        "401": { $ref: "shared-schemas.yaml#/components/responses/Problem401" }
+        "423":
+          description: urn:problem:sca-locked — too many failures in session.
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+
+  /sca/enroll:
+    post:
+      tags: [SCA]
+      summary: Enrol a new SCA factor (first login)
+      operationId: scaEnroll
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [factorType]
+              properties:
+                factorType: { $ref: "shared-schemas.yaml#/components/schemas/ScaFactorType" }
+      responses:
+        "200":
+          description: Enrolment initiated; UI renders factor-specific setup.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  enrollmentId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+                  setupPayload:
+                    type: object
+                    description: Factor-specific (e.g., TOTP secret for QR scan).
+                    additionalProperties: true
+
+  #############################################################################
+  # Privacy notice (UC-G45)
+  #############################################################################
+  /api/v1/public/privacy-notice/latest:
+    get:
+      tags: [PrivacyNotice]
+      summary: Current privacy-notice version metadata
+      description: Unauthenticated; callable before login.
+      operationId: privacyNoticeLatest
+      responses:
+        "200":
+          description: Metadata for the current notice.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [version, publishedAt, materialChange, locales, urls]
+                properties:
+                  version: { type: string, example: v1 }
+                  publishedAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+                  materialChange: { type: boolean }
+                  locales:
+                    type: array
+                    items: { $ref: "shared-schemas.yaml#/components/schemas/Locale" }
+                  urls:
+                    type: object
+                    properties:
+                      md: { type: string, format: uri }
+                      pdf: { type: string, format: uri }
+                  changeSummaryKey:
+                    type: string
+                    description: i18n key for "what changed" bullets.
+
+  /api/v1/customer/privacy-notice/status:
+    get:
+      tags: [PrivacyNotice]
+      summary: Per-user acceptance status
+      operationId: privacyNoticeStatus
+      security:
+        - OAuth2Customer: []
+      responses:
+        "200":
+          description: Acceptance status.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [currentVersion, materialChangeSinceAccepted]
+                properties:
+                  currentVersion: { type: string }
+                  userAcceptedVersion: { type: string, nullable: true }
+                  materialChangeSinceAccepted: { type: boolean }
+
+  /api/v1/customer/privacy-notice/accept:
+    post:
+      tags: [PrivacyNotice]
+      summary: Record acceptance of a notice version (UC-G45 §6.2 step 5)
+      operationId: privacyNoticeAccept
+      security:
+        - OAuth2Customer: []
+      parameters:
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [version]
+              properties:
+                version: { type: string }
+      responses:
+        "204":
+          description: Acceptance recorded.
+        "409":
+          description: Version mismatch — client's version is older than current.
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+
+  #############################################################################
+  # Session
+  #############################################################################
+  /api/v1/customer/session/stream:
+    get:
+      tags: [Session]
+      summary: Session SSE stream (UC-G52, UC-G53)
+      description: |
+        Server-Sent Events stream delivering `session.warning` (T-60s) and
+        `session.revoked` events. Authenticated via one-time stream token per
+        `gui/architecture/SSE_CONVENTIONS.md`.
+      operationId: sessionStream
+      parameters:
+        - name: token
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: text/event-stream
+          content:
+            text/event-stream:
+              schema:
+                type: string
+
+  /api/v1/customer/session/stream-token:
+    post:
+      tags: [Session]
+      summary: Acquire one-time SSE stream token for session events
+      operationId: sessionStreamToken
+      security:
+        - OAuth2Customer: []
+      parameters:
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+      responses:
+        "200":
+          description: Stream token.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [streamToken, expiresIn]
+                properties:
+                  streamToken: { type: string }
+                  expiresIn: { type: integer, example: 300 }
+
+  /api/v1/customer/session/active:
+    get:
+      tags: [Session]
+      summary: List active sessions (FS.13, UC-G53 open question resolved)
+      description: |
+        Returns the customer's active sessions across devices. Each entry
+        includes a device hint, last-seen timestamp, and a session id the
+        customer can revoke individually.
+      operationId: sessionsActive
+      security:
+        - OAuth2Customer: []
+      responses:
+        "200":
+          description: Active sessions.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  required: [sessionId, deviceName, lastSeenAt, current]
+                  properties:
+                    sessionId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+                    deviceName: { type: string, example: "iPhone 15 Pro" }
+                    userAgent: { type: string }
+                    lastSeenAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+                    current: { type: boolean }
+                    ipCountry:
+                      type: string
+                      pattern: "^[A-Z]{2}$"
+
+  /api/v1/customer/session/{sessionId}:
+    delete:
+      tags: [Session]
+      summary: Revoke a specific session
+      operationId: sessionRevokeOne
+      security:
+        - OAuth2Customer: []
+      parameters:
+        - name: sessionId
+          in: path
+          required: true
+          schema: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+      responses:
+        "204":
+          description: Session revoked.
+        "404":
+          description: Session not found.
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+
+components:
+  securitySchemes:
+    BearerAuth:
+      $ref: "shared-schemas.yaml#/components/securitySchemes/BearerAuth"
+    OAuth2Customer:
+      $ref: "shared-schemas.yaml#/components/securitySchemes/OAuth2Customer"
+    OAuth2Admin:
+      $ref: "shared-schemas.yaml#/components/securitySchemes/OAuth2Admin"

@@ -1,0 +1,564 @@
+openapi: 3.1.0
+info:
+  title: JRPay — Admin Payments
+  version: 1.0.0
+  description: |
+    Admin-facing stuck-payment investigation + return surface. Realises
+    UC-G37 (pacs.028 status-query on payments stuck > 2 h and resolve)
+    and UC-G38 (pacs.004 return).
+
+    Hosted by A2 (clearing engine) with admin controllers. Every mutation
+    requires step-up SCA:
+
+    - `POST /pacs028` — class `admin-action`,
+      `action=ISSUE_PACS028`, `resourceType=payment`.
+    - `POST /resolve` — `action=RESOLVE_PAYMENT`.
+    - `POST /return`  — `action=RETURN_PAYMENT`.
+
+    An SSE stream surfaces pacs.002 / pacs.029 responses and stuck-queue
+    updates in real time.
+
+    See `shared-schemas.yaml` for enums + Problem envelope + pagination.
+
+servers:
+  - url: "https://admin-api.{env}.jrpay.example"
+    variables: { env: { default: dev } }
+  - url: "http://localhost:8092"
+    description: Local dev (A2 port)
+
+tags:
+  - name: Investigations
+    description: UC-G37 — queue, detail, pacs.028, resolve
+  - name: Return
+    description: UC-G38 — pacs.004 return
+  - name: Investigations-Stream
+    description: SSE per SSE_CONVENTIONS.md
+
+paths:
+  #############################################################################
+  # Queue + detail
+  #############################################################################
+  /api/v1/admin/payments/investigations:
+    get:
+      tags: [Investigations]
+      summary: List stuck payments (UC-G37 §6.1)
+      description: |
+        Default filter: `status=OPEN`, age bucket `2-6h`. Age is computed
+        from `lastStateChangeAt`. Only non-terminal payments appear;
+        terminal-state transitions remove rows via SSE.
+      operationId: listInvestigations
+      security:
+        - OAuth2Admin: [payments:investigate]
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: array
+            items:
+              type: string
+              enum: [OPEN, CLOSED, MANUALLY_RESOLVED]
+          style: form
+          explode: true
+        - name: ageBucket
+          in: query
+          schema:
+            type: array
+            items:
+              type: string
+              enum: [H2_6, H6_24, OVER_24]
+          style: form
+          explode: true
+        - name: debtorBank
+          in: query
+          description: BIC filter on the debtor side.
+          schema: { $ref: "shared-schemas.yaml#/components/schemas/Bic" }
+        - name: creditorBank
+          in: query
+          schema: { $ref: "shared-schemas.yaml#/components/schemas/Bic" }
+        - name: amountMin
+          in: query
+          schema: { $ref: "shared-schemas.yaml#/components/schemas/MonetaryAmount" }
+        - name: amountMax
+          in: query
+          schema: { $ref: "shared-schemas.yaml#/components/schemas/MonetaryAmount" }
+        - $ref: "shared-schemas.yaml#/components/parameters/PageNumber"
+        - $ref: "shared-schemas.yaml#/components/parameters/PageSize"
+        - $ref: "shared-schemas.yaml#/components/parameters/SortAsc"
+      responses:
+        "200":
+          description: Paginated investigations.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, page, counters]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/InvestigationSummary" }
+                  page: { $ref: "shared-schemas.yaml#/components/schemas/PageMeta" }
+                  counters:
+                    type: object
+                    required: [openTotal, over24h]
+                    properties:
+                      openTotal: { type: integer, minimum: 0 }
+                      over24h: { type: integer, minimum: 0 }
+
+  /api/v1/admin/payments/{paymentId}:
+    get:
+      tags: [Investigations]
+      summary: Payment detail (admin view)
+      description: |
+        Full state timeline with Kafka offsets (drill-through for
+        operations), pacs.028 history, pacs.002/029 responses, and
+        internal metadata.
+      operationId: getAdminPayment
+      security:
+        - OAuth2Admin: [payments:investigate]
+      parameters:
+        - $ref: "#/components/parameters/PaymentId"
+      responses:
+        "200":
+          description: Payment detail.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AdminPaymentDetail" }
+        "404": { $ref: "shared-schemas.yaml#/components/responses/Problem404" }
+
+  #############################################################################
+  # pacs.028 (UC-G37 §6.3)
+  #############################################################################
+  /api/v1/admin/payments/{paymentId}/pacs028:
+    post:
+      tags: [Investigations]
+      summary: Issue a pacs.028 status query (UC-G37 §6.3)
+      description: |
+        Dispatches a pacs.028 to the correspondent. Returns a `queryId`.
+        Responses arrive asynchronously and surface via SSE +
+        investigation detail refresh. Per-payment rate limit: 1 query /
+        15 min (UC-G37 retry guidance); cooldown enforced server-side.
+      operationId: issuePacs028
+      security:
+        - OAuth2Admin: [payments:investigate]
+      parameters:
+        - $ref: "#/components/parameters/PaymentId"
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+        - $ref: "shared-schemas.yaml#/components/parameters/StepUpToken"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/Pacs028Request" }
+      responses:
+        "200":
+          description: Query dispatched.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Pacs028Ack" }
+        "401":
+          description: urn:problem:step-up-required
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+        "403":
+          description: urn:problem:dynamic-linking-mismatch
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+        "404": { $ref: "shared-schemas.yaml#/components/responses/Problem404" }
+        "429":
+          description: urn:problem:rate-limit — cooldown 15 min not elapsed.
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+
+  /api/v1/admin/payments/pacs028/bulk:
+    post:
+      tags: [Investigations]
+      summary: Bulk pacs.028 (UC-G37 AF-02) — max 20 payments
+      description: |
+        Sends pacs.028 queries for up to 20 payments in a single call.
+        Step-up SCA required once for the whole batch. Per-payment audit
+        row is still written. Server rejects > 20 with `422`.
+      operationId: issuePacs028Bulk
+      security:
+        - OAuth2Admin: [payments:investigate]
+      parameters:
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+        - $ref: "shared-schemas.yaml#/components/parameters/StepUpToken"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/Pacs028BulkRequest" }
+      responses:
+        "200":
+          description: Batch dispatched.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Pacs028BulkAck" }
+        "403":
+          description: urn:problem:dynamic-linking-mismatch
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+        "422":
+          description: Too many payments, duplicate ids, or notes too short.
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+
+  #############################################################################
+  # Mark resolved (UC-G37 §6.4)
+  #############################################################################
+  /api/v1/admin/payments/{paymentId}/resolve:
+    post:
+      tags: [Investigations]
+      summary: Mark payment manually resolved (UC-G37 §6.4)
+      description: |
+        Sets payment state to `MANUALLY_RESOLVED`. No funds move. Notes
+        ≥ 50 chars required. Step-up SCA with `action=RESOLVE_PAYMENT`.
+      operationId: resolvePayment
+      security:
+        - OAuth2Admin: [payments:investigate]
+      parameters:
+        - $ref: "#/components/parameters/PaymentId"
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+        - $ref: "shared-schemas.yaml#/components/parameters/StepUpToken"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ResolvePaymentRequest" }
+      responses:
+        "200":
+          description: Resolved.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AdminPaymentDetail" }
+        "409":
+          description: urn:problem:pending-execution — terminal state already reached.
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+
+  #############################################################################
+  # Return (UC-G38)
+  #############################################################################
+  /api/v1/admin/payments/{paymentId}/return:
+    post:
+      tags: [Return]
+      summary: Issue pacs.004 return (UC-G38)
+      description: |
+        Creates a new pacs.004 return payment linked to the original via
+        `originalPaymentId`. Original must be SETTLED. Partial returns are
+        allowed up to the original amount. Step-up SCA with
+        `action=RETURN_PAYMENT`.
+      operationId: returnPayment
+      security:
+        - OAuth2Admin: [payments:investigate]
+      parameters:
+        - $ref: "#/components/parameters/PaymentId"
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+        - $ref: "shared-schemas.yaml#/components/parameters/StepUpToken"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ReturnPaymentRequest" }
+      responses:
+        "201":
+          description: Return created.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ReturnPaymentAck" }
+        "403":
+          description: urn:problem:dynamic-linking-mismatch
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+        "409":
+          description: urn:problem:already-returned — original already has a return.
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+        "422":
+          description: |
+            `urn:problem:insufficient-funds-for-return` — creditor account
+            cannot cover the return.
+          content:
+            application/problem+json:
+              schema: { $ref: "shared-schemas.yaml#/components/schemas/Problem" }
+
+  #############################################################################
+  # SSE
+  #############################################################################
+  /api/v1/admin/payments/investigations/stream-token:
+    post:
+      tags: [Investigations-Stream]
+      summary: One-time SSE stream token
+      operationId: investigationsStreamToken
+      security:
+        - OAuth2Admin: [payments:investigate]
+      parameters:
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                paymentId:
+                  description: Scope to a specific payment's timeline.
+                  $ref: "shared-schemas.yaml#/components/schemas/Uuid"
+      responses:
+        "200":
+          description: Stream token.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [streamToken, expiresIn]
+                properties:
+                  streamToken: { type: string }
+                  expiresIn: { type: integer, example: 300 }
+
+  /api/v1/admin/payments/investigations/stream:
+    get:
+      tags: [Investigations-Stream]
+      summary: Investigations SSE
+      description: |
+        Events: `investigation.pacs028-response`,
+        `investigation.status-changed`. Heartbeat 15 s; single-use token.
+      operationId: investigationsStream
+      parameters:
+        - name: token
+          in: query
+          required: true
+          schema: { type: string }
+        - name: Last-Event-ID
+          in: header
+          required: false
+          schema: { type: string }
+      responses:
+        "200":
+          description: text/event-stream
+          content:
+            text/event-stream:
+              schema: { type: string }
+
+components:
+  securitySchemes:
+    OAuth2Admin:
+      $ref: "shared-schemas.yaml#/components/securitySchemes/OAuth2Admin"
+
+  parameters:
+    PaymentId:
+      name: paymentId
+      in: path
+      required: true
+      schema: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+
+  schemas:
+    InvestigationSummary:
+      type: object
+      required:
+        - paymentId
+        - status
+        - debtorIbanMasked
+        - creditorIbanMasked
+        - amount
+        - currency
+        - ageHours
+        - lastStateChangeAt
+      properties:
+        paymentId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+        status: { $ref: "shared-schemas.yaml#/components/schemas/PaymentStatus" }
+        debtorIbanMasked: { type: string }
+        creditorIbanMasked: { type: string }
+        debtorBic: { $ref: "shared-schemas.yaml#/components/schemas/Bic" }
+        creditorBic: { $ref: "shared-schemas.yaml#/components/schemas/Bic" }
+        amount: { $ref: "shared-schemas.yaml#/components/schemas/MonetaryAmount" }
+        currency: { $ref: "shared-schemas.yaml#/components/schemas/Currency" }
+        ageHours:
+          type: number
+          minimum: 0
+        lastStateChangeAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        lastPacs028At: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        executionMode: { $ref: "shared-schemas.yaml#/components/schemas/ExecutionMode" }
+
+    AdminPaymentDetail:
+      type: object
+      required: [paymentId, status, amount, currency, timeline]
+      properties:
+        paymentId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+        status: { $ref: "shared-schemas.yaml#/components/schemas/PaymentStatus" }
+        amount: { $ref: "shared-schemas.yaml#/components/schemas/MonetaryAmount" }
+        currency: { $ref: "shared-schemas.yaml#/components/schemas/Currency" }
+        executionMode: { $ref: "shared-schemas.yaml#/components/schemas/ExecutionMode" }
+        debtorIban: { $ref: "shared-schemas.yaml#/components/schemas/Iban" }
+        creditorIban: { $ref: "shared-schemas.yaml#/components/schemas/Iban" }
+        creditorName: { $ref: "shared-schemas.yaml#/components/schemas/Name" }
+        reference: { type: string }
+        createdAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        settlementInstant: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        rejectionReason:
+          $ref: "shared-schemas.yaml#/components/schemas/InternalRejectionReason"
+        returnedAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        returnedBy: { type: string }
+        returnPaymentId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+        originalPaymentId:
+          description: Set on a pacs.004 return payment.
+          $ref: "shared-schemas.yaml#/components/schemas/Uuid"
+        timeline:
+          type: array
+          items: { $ref: "#/components/schemas/AdminPaymentTimelineEntry" }
+        pacs028History:
+          type: array
+          items: { $ref: "#/components/schemas/Pacs028HistoryEntry" }
+
+    AdminPaymentTimelineEntry:
+      type: object
+      required: [at, kafkaOffset, status]
+      properties:
+        at: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        status: { $ref: "shared-schemas.yaml#/components/schemas/PaymentStatus" }
+        kafkaTopic: { type: string }
+        kafkaOffset: { type: integer, minimum: 0 }
+        kafkaPartition: { type: integer, minimum: 0 }
+        correlationId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+        note: { type: string, maxLength: 280 }
+
+    Pacs028HistoryEntry:
+      type: object
+      required: [queryId, reason, sentAt, status]
+      properties:
+        queryId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+        reason:
+          type: string
+          enum: [STATUS_QUERY, REQUEST_CANCEL, OTHER]
+        sentAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        receivedAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        status:
+          type: string
+          enum: [PENDING, RESPONDED, TIMED_OUT, FAILED]
+        responseType:
+          type: string
+          enum: [pacs.002, pacs.029, pacs.028, NONE]
+        responseCode: { type: string }
+        responseText: { type: string, maxLength: 2000 }
+        operator: { type: string }
+        notesSummary: { type: string, maxLength: 140 }
+
+    Pacs028Request:
+      type: object
+      required: [reason, notes]
+      additionalProperties: false
+      properties:
+        reason:
+          type: string
+          enum: [STATUS_QUERY, REQUEST_CANCEL, OTHER]
+        targetBic:
+          description: |
+            Optional override; defaults to the payment's creditor bank.
+            Used when the scheme directs a query to an intermediary.
+          $ref: "shared-schemas.yaml#/components/schemas/Bic"
+        notes:
+          type: string
+          minLength: 20
+          maxLength: 2000
+
+    Pacs028Ack:
+      type: object
+      required: [queryId, sentAt, expectedResponseBy]
+      properties:
+        queryId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+        sentAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        expectedResponseBy:
+          description: Soft SLA; correspondent typically responds within 4 h.
+          $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant"
+
+    Pacs028BulkRequest:
+      type: object
+      required: [paymentIds, reason, notes]
+      additionalProperties: false
+      properties:
+        paymentIds:
+          type: array
+          minItems: 1
+          maxItems: 20
+          items: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+        reason:
+          type: string
+          enum: [STATUS_QUERY, REQUEST_CANCEL, OTHER]
+        notes:
+          type: string
+          minLength: 20
+          maxLength: 2000
+
+    Pacs028BulkAck:
+      type: object
+      required: [total, succeeded, failed, results]
+      properties:
+        total: { type: integer }
+        succeeded: { type: integer }
+        failed: { type: integer }
+        results:
+          type: array
+          items:
+            type: object
+            required: [paymentId, outcome]
+            properties:
+              paymentId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+              outcome:
+                type: string
+                enum: [DISPATCHED, RATE_LIMITED, NOT_FOUND, INTERNAL_ERROR]
+              queryId:
+                description: Present when `outcome=DISPATCHED`.
+                $ref: "shared-schemas.yaml#/components/schemas/Uuid"
+
+    ResolvePaymentRequest:
+      type: object
+      required: [notes, confirmedCriteria]
+      additionalProperties: false
+      properties:
+        notes:
+          type: string
+          minLength: 50
+          maxLength: 2000
+        confirmedCriteria: { type: boolean }
+
+    ReturnPaymentRequest:
+      type: object
+      required: [reason, notes, confirmedCriteria]
+      additionalProperties: false
+      properties:
+        reason:
+          type: string
+          enum: [ACCOUNT_CLOSED, CUSTOMER_REQUEST, FRAUD_REFUND, OTHER]
+        amount:
+          description: |
+            Optional; defaults to original full amount. Must be ≤ original
+            amount (server-validated; partial returns supported — UC-G38
+            AF-03).
+          $ref: "shared-schemas.yaml#/components/schemas/MonetaryAmount"
+        notes:
+          type: string
+          minLength: 50
+          maxLength: 2000
+        confirmedCriteria: { type: boolean }
+
+    ReturnPaymentAck:
+      type: object
+      required: [originalPaymentId, returnPaymentId, amount, currency, createdAt]
+      properties:
+        originalPaymentId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+        returnPaymentId: { $ref: "shared-schemas.yaml#/components/schemas/Uuid" }
+        amount: { $ref: "shared-schemas.yaml#/components/schemas/MonetaryAmount" }
+        currency: { $ref: "shared-schemas.yaml#/components/schemas/Currency" }
+        createdAt: { $ref: "shared-schemas.yaml#/components/schemas/Iso8601Instant" }
+        status:
+          description: Initial status of the return payment.
+          $ref: "shared-schemas.yaml#/components/schemas/PaymentStatus"

@@ -1,0 +1,43 @@
+spring:
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    properties:
+      hibernate.jdbc.time_zone: UTC
+  flyway:
+    enabled: true
+
+server:
+  port: 0
+
+management:
+  server:
+    port: -1
+
+jrpay:
+  identity:
+    issuer: http://localhost
+    sca:
+      max-attempts: 3
+      session-ttl: PT5M
+    jwt:
+      step-up-token-ttl: PT5M
+    password-reset:
+      token-ttl: PT30M
+      rate-limit-per-hour: 3
+    password-policy:
+      min-length: 10
+      max-length: 128
+      require-mixed-case: true
+      require-digit: true
+      require-symbol: false
+    privacy-notice:
+      current-version: "v1"
+      published-at: "2026-04-24T00:00:00Z"
+      material-change: false
+
+logging:
+  level:
+    root: WARN
+    com.jrpay: INFO
+    com.jrpay.identity.passwordreset.LoggingEmailGateway: TRACE
